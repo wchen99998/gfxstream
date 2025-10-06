@@ -664,12 +664,6 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
     gl::EmulationGl& getEmulationGl();
     bool hasEmulationGl() const { return m_emulationGl != nullptr; }
 
-    vk::VkEmulation& getEmulationVk();
-    bool hasEmulationVk() const { return m_emulationVk != nullptr; }
-
-    bool setColorBufferVulkanMode(HandleType colorBufferHandle, uint32_t mode);
-    int32_t mapGpaToBufferHandle(uint32_t bufferHandle, uint64_t gpa, uint64_t size);
-
     // Return the host EGLDisplay used by this instance.
     EGLDisplay getDisplay() const;
     EGLSurface getWindowSurface() const;
@@ -765,6 +759,12 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
     const gl::EGLDispatch* getEglDispatch();
     const gl::GLESv2Dispatch* getGles2Dispatch();
 #endif
+
+    vk::VkEmulation& getEmulationVk();
+    bool hasEmulationVk() const { return m_emulationVk != nullptr; }
+
+    bool setColorBufferVulkanMode(HandleType colorBufferHandle, uint32_t mode);
+    int32_t mapGpaToBufferHandle(uint32_t bufferHandle, uint64_t gpa, uint64_t size);
 
     // Retrieve the vendor info strings for the GPU driver used for the emulation.
     // On return, |*vendor|, |*renderer| and |*version| will point to strings
@@ -922,7 +922,9 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
         }
     };
     std::map<uint32_t, onPost> m_onPost;
+#if GFXSTREAM_ENABLE_HOST_GLES
     ReadbackWorker* m_readbackWorker = nullptr;
+#endif
     gfxstream::base::WorkerThread<Readback> m_readbackThread;
     std::atomic_bool m_readbackThreadStarted = false;
 
@@ -1475,6 +1477,7 @@ FrameBuffer::Impl::~Impl() {
 
 WorkerProcessingResult FrameBuffer::Impl::sendReadbackWorkerCmd(const Readback& readback) {
     ensureReadbackWorker();
+#if GFXSTREAM_ENABLE_HOST_GLES
     switch (readback.cmd) {
     case ReadbackCmd::Init:
         m_readbackWorker->init();
@@ -1491,6 +1494,7 @@ WorkerProcessingResult FrameBuffer::Impl::sendReadbackWorkerCmd(const Readback& 
     case ReadbackCmd::Exit:
         return WorkerProcessingResult::Stop;
     }
+#endif
     return WorkerProcessingResult::Stop;
 }
 
@@ -1907,9 +1911,11 @@ HandleType FrameBuffer::Impl::genHandle_locked() {
 
 bool FrameBuffer::Impl::isFormatSupported(GfxstreamFormat format) {
     bool supported = true;
+#if GFXSTREAM_ENABLE_HOST_GLES
     if (m_emulationGl) {
         supported &= m_emulationGl->isFormatSupported(format);
     }
+#endif
     if (m_emulationVk) {
         supported &= m_emulationVk->isFormatSupported(format);
     }
@@ -2289,8 +2295,8 @@ void FrameBuffer::Impl::cleanupProcGLObjects(uint64_t puid) {
 std::vector<HandleType> FrameBuffer::Impl::cleanupProcGLObjects_locked(uint64_t puid, bool forced) {
     std::vector<HandleType> colorBuffersToCleanup;
     {
-        std::unique_ptr<RecursiveScopedContextBind> bind = nullptr;
 #if GFXSTREAM_ENABLE_HOST_GLES
+        std::unique_ptr<RecursiveScopedContextBind> bind = nullptr;
         if (m_emulationGl) {
             bind = std::make_unique<RecursiveScopedContextBind>(getPbufferSurfaceContextHelper());
         }
@@ -2624,11 +2630,13 @@ AsyncResult FrameBuffer::Impl::postImpl(HandleType p_colorbuffer, Post::Completi
 
             if (asyncReadbackSupported()) {
                 ensureReadbackWorker();
+#if GFXSTREAM_ENABLE_HOST_GLES
                 const auto status = m_readbackWorker->doNextReadback(
                     iter.first, cb.get(), iter.second.img, repaint, iter.second.readBgra);
                 if (status == ReadbackWorker::DoNextReadbackResult::OK_READY_FOR_READ) {
                     doPostCallback(iter.second.img, iter.first);
                 }
+#endif
             } else {
     #if GFXSTREAM_ENABLE_HOST_GLES
                 cb->glOpReadback(iter.second.img, iter.second.readBgra);
@@ -2675,10 +2683,12 @@ void FrameBuffer::Impl::flushReadPipeline(int displayId) {
 
     ensureReadbackWorker();
 
+#if GFXSTREAM_ENABLE_HOST_GLES
     const auto status = m_readbackWorker->flushPipeline(displayId);
     if (status == ReadbackWorker::FlushResult::OK_READY_FOR_READ) {
         doPostCallback(nullptr, displayId);
     }
+#endif
 }
 
 void FrameBuffer::Impl::ensureReadbackWorker() {
@@ -3011,8 +3021,8 @@ void FrameBuffer::Impl::onSave(Stream* stream, const ITextureSaverPtr& textureSa
     //     m_prevDrawSurf
     AutoLock mutex(m_lock);
 
-    std::unique_ptr<RecursiveScopedContextBind> bind;
 #if GFXSTREAM_ENABLE_HOST_GLES
+    std::unique_ptr<RecursiveScopedContextBind> bind;
     if (m_emulationGl) {
         // Some snapshot commands try using GL.
         bind = std::make_unique<RecursiveScopedContextBind>(getPbufferSurfaceContextHelper());
@@ -3139,8 +3149,8 @@ bool FrameBuffer::Impl::onLoad(Stream* stream, const ITextureLoaderPtr& textureL
     {
         sweepColorBuffersLocked();
 
-        std::unique_ptr<RecursiveScopedContextBind> bind;
 #if GFXSTREAM_ENABLE_HOST_GLES
+        std::unique_ptr<RecursiveScopedContextBind> bind;
         if (m_emulationGl) {
             // Some snapshot commands try using GL.
             bind = std::make_unique<RecursiveScopedContextBind>(getPbufferSurfaceContextHelper());
@@ -3364,8 +3374,8 @@ bool FrameBuffer::Impl::onLoad(Stream* stream, const ITextureLoaderPtr& textureL
 #endif
 
     {
-        std::unique_ptr<RecursiveScopedContextBind> bind;
 #if GFXSTREAM_ENABLE_HOST_GLES
+        std::unique_ptr<RecursiveScopedContextBind> bind;
         if (m_emulationGl) {
             // Some snapshot commands try using GL.
             bind = std::make_unique<RecursiveScopedContextBind>(getPbufferSurfaceContextHelper());
@@ -4950,7 +4960,9 @@ void FrameBuffer::unlockContextStructureRead() { mImpl->unlockContextStructureRe
 
 void FrameBuffer::createTrivialContext(HandleType shared, HandleType* contextOut,
                                        HandleType* surfOut) {
+#if GFXSTREAM_ENABLE_HOST_GLES
     mImpl->createTrivialContext(shared, contextOut, surfOut);
+#endif
 }
 
 void FrameBuffer::setShuttingDown() { mImpl->setShuttingDown(); }
@@ -4991,7 +5003,9 @@ float FrameBuffer::getPy() const { return mImpl->getPy(); }
 int FrameBuffer::getZrot() const { return mImpl->getZrot(); }
 
 void FrameBuffer::setScreenMask(int width, int height, const uint8_t* rgbaData) {
+#if GFXSTREAM_ENABLE_HOST_GLES
     mImpl->setScreenMask(width, height, rgbaData);
+#endif
 }
 
 void FrameBuffer::setScreenBackground(int width, int height, const uint8_t* rgbaData) {
@@ -5138,7 +5152,9 @@ std::optional<BlobDescriptorInfo> FrameBuffer::exportBuffer(HandleType bufferHan
     return mImpl->exportBuffer(bufferHandle);
 }
 
+#if GFXSTREAM_ENABLE_HOST_GLES
 bool FrameBuffer::hasEmulationGl() const { return mImpl->hasEmulationGl(); }
+#endif
 
 bool FrameBuffer::hasEmulationVk() const { return mImpl->hasEmulationVk(); }
 
@@ -5193,11 +5209,6 @@ EGLint FrameBuffer::getConfigs(uint32_t bufferSize, GLuint* buffer) {
 
 EGLint FrameBuffer::chooseConfig(EGLint* attribs, EGLint* configs, EGLint configsSize) {
     return mImpl->chooseConfig(attribs, configs, configsSize);
-}
-
-void FrameBuffer::getDeviceInfo(const char** vendor, const char** renderer,
-                               const char** version) const {
-    mImpl->getDeviceInfo(vendor, renderer, version);
 }
 
 HandleType FrameBuffer::createEmulatedEglContext(int p_config, HandleType p_share,
@@ -5339,6 +5350,11 @@ const void* FrameBuffer::getEglDispatch() { return mImpl->getEglDispatch(); }
 const void* FrameBuffer::getGles2Dispatch() { return mImpl->getGles2Dispatch(); }
 
 #endif
+
+void FrameBuffer::getDeviceInfo(const char** vendor, const char** renderer,
+                               const char** version) const {
+    mImpl->getDeviceInfo(vendor, renderer, version);
+}
 
 const FeatureSet& FrameBuffer::getFeatures() const { return mImpl->getFeatures(); }
 
