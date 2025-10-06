@@ -154,7 +154,7 @@ static constexpr const char* const kEmulatedDeviceExtensions[] = {
     VK_KHR_EXTERNAL_FENCE_EXTENSION_NAME,
     VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME,
     VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME,
-#if defined(__QNX__)
+#if defined(__QNX__) || defined(__APPLE__)
     VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
     VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
 #endif
@@ -1920,6 +1920,15 @@ class VkDecoderGlobalState::Impl {
             properties.push_back(mvk_props);
         }
 #endif
+
+        // VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME is emulated by gfxstream
+        if (!hasDeviceExtension(properties, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME)) {
+            VkExtensionProperties queue_props;
+            strncpy(queue_props.extensionName, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
+                    sizeof(queue_props.extensionName));
+            queue_props.specVersion = VK_EXT_QUEUE_FAMILY_FOREIGN_SPEC_VERSION;
+            properties.push_back(queue_props);
+        }
 
         if (m_vkEmulation->isYcbcrEmulationEnabled() &&
             !hasDeviceExtension(properties, VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME)) {
