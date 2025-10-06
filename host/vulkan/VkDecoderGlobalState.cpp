@@ -9366,6 +9366,8 @@ class VkDecoderGlobalState::Impl {
 #if defined(__APPLE__)
         if (m_vkEmulation->supportsMoltenVk()) {
             res.push_back(VK_MVK_MACOS_SURFACE_EXTENSION_NAME);
+        }
+        if (m_vkEmulation->supportsPortabilityEnumeration()) {
             res.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
         }
 #endif

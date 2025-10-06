@@ -835,6 +835,8 @@ std::unique_ptr<VkEmulation> VkEmulation::create(VulkanDispatch* gvk,
 #if defined(__APPLE__)
     std::vector<const char*> moltenVkInstanceExtNames = {
         VK_MVK_MACOS_SURFACE_EXTENSION_NAME,
+    };
+    std::vector<const char*> portabilityEnumerationNames = {
         VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME,
     };
     std::vector<const char*> moltenVkDeviceExtNames = {
@@ -861,11 +863,13 @@ std::unique_ptr<VkEmulation> VkEmulation::create(VulkanDispatch* gvk,
     bool externalFenceCapabilitiesSupported = getPhysicalDeviceProperties2Supported &&
         extensionsSupported(instanceExts, externalFenceInstanceExtNames);
     bool surfaceSupported = extensionsSupported(instanceExts, surfaceInstanceExtNames);
+    bool usePortabilityEnumeration = false;
 #if defined(__APPLE__)
     const std::string vulkanIcd = gfxstream::base::getEnvironmentVariable("ANDROID_EMU_VK_ICD");
     const bool moltenVKRequested = (vulkanIcd == "moltenvk");
     const bool useExternalMemoryMetal = moltenVKRequested || (vulkanIcd == "kosmickrisp");
     const bool moltenVKSupported = extensionsSupported(instanceExts, moltenVkInstanceExtNames);
+    usePortabilityEnumeration = extensionsSupported(instanceExts, portabilityEnumerationNames);
     if (moltenVKRequested && !moltenVKSupported) {
         // This might happen if the user manually changes moltenvk ICD library
         // Just a warning to enable a later version without or other drivers without portability
@@ -945,7 +949,7 @@ std::unique_ptr<VkEmulation> VkEmulation::create(VulkanDispatch* gvk,
     }
 
 #if defined(__APPLE__)
-    if (useMoltenVK) {
+    if (useMoltenVK && usePortabilityEnumeration) {
         GFXSTREAM_INFO("MoltenVK is supported, enabling Vulkan portability.");
         instCi.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
         for (auto extension : moltenVkInstanceExtNames) {
@@ -1052,6 +1056,7 @@ std::unique_ptr<VkEmulation> VkEmulation::create(VulkanDispatch* gvk,
 #if defined(__APPLE__)
     emulation->mInstanceSupportsMoltenVK = useMoltenVK;
     emulation->mInstanceSupportsExternalMemoryMetal = useExternalMemoryMetal;
+    emulation->mInstanceSupportsPortabilityEnumeration = usePortabilityEnumeration;
 #endif
 
     if (emulation->mInstanceSupportsGetPhysicalDeviceProperties2) {
@@ -1793,6 +1798,8 @@ bool VkEmulation::supportsSurfaces() const { return mInstanceSupportsSurface; }
 bool VkEmulation::supportsMoltenVk() const { return mInstanceSupportsMoltenVK; }
 
 bool VkEmulation::supportsExternalMemoryMetal() const { return mInstanceSupportsExternalMemoryMetal; }
+
+bool VkEmulation::supportsPortabilityEnumeration() const { return mInstanceSupportsPortabilityEnumeration; }
 
 bool VkEmulation::supportsPhysicalDeviceIDProperties() const {
     return mInstanceSupportsPhysicalDeviceIDProperties;

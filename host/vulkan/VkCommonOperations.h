@@ -117,6 +117,7 @@ class VkEmulation {
     bool supportsSurfaces() const;
     bool supportsMoltenVk() const;
     bool supportsExternalMemoryMetal() const;
+    bool supportsPortabilityEnumeration() const;
 
     bool supportsGetPhysicalDeviceProperties2() const;
 
@@ -578,9 +579,11 @@ class VkEmulation {
 #if defined(__APPLE__)
     bool mInstanceSupportsMoltenVK = false;
     bool mInstanceSupportsExternalMemoryMetal = false;
+    bool mInstanceSupportsPortabilityEnumeration = false;
 #else
     static const bool mInstanceSupportsMoltenVK = false;
     static const bool mInstanceSupportsExternalMemoryMetal = false;
+    static const bool mInstanceSupportsPortabilityEnumeration = false;
 #endif
 
     PFN_vkGetPhysicalDeviceImageFormatProperties2KHR mGetImageFormatProperties2Func = nullptr;
