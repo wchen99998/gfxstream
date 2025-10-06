@@ -1146,7 +1146,7 @@ std::unique_ptr<VkEmulation> VkEmulation::create(VulkanDispatch* gvk,
         }
 
 // TODO(aruby@qnx.com): Remove once dmabuf extension support has been flushed out on QNX
-#if !defined(__QNX__)
+#if !defined(__QNX__) && !defined(__APPLE__)
         bool dmaBufBlockList = (deviceInfos[i].driverVendor == "NVIDIA (Vendor 0x10de)");
 #ifdef CONFIG_AEMU
         // TODO(b/400999642): dma_buf support should be checked with image format support
