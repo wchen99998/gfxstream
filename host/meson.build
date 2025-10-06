@@ -177,6 +177,14 @@ if host_machine.system() == 'qnx'
   ]
 endif
 
+if host_machine.system() == 'darwin'
+  deps_gfxstream_backend += [
+    cocoa_dep,
+    corefoundation_dep,
+    iokit_dep,
+  ]
+endif
+
 gfxstream_backend = library(
   'gfxstream_backend',
   files_lib_gfxstream_backend,

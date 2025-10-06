@@ -82,6 +82,13 @@ else
   thread_dep = dependency('threads')
 endif
 
+if host_machine.system() == 'darwin'
+  add_languages('objc', 'objcpp')
+  cocoa_dep = dependency('appleframeworks', modules: 'Cocoa', required: true)
+  corefoundation_dep = dependency('appleframeworks', modules: 'CoreFoundation', required: true)
+  iokit_dep = dependency('appleframeworks', modules: 'IOKit', required: true)
+endif
+
 if log_level == 'error'
   gfxstream_host_args += '-DSTREAM_RENDERER_LOG_LEVEL=1'
 elif log_level == 'warn'

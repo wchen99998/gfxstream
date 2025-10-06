@@ -62,6 +62,15 @@ elif host_machine.system() == 'qnx'
   vulkan_server_cpp_args += '-DVK_USE_PLATFORM_SCREEN_QNX'
 endif
 
+if use_gles
+  additional_includes = [
+    inc_gl_openglesdispatch,
+    inc_gl_server
+  ]
+else
+  additional_includes = []
+endif
+
 lib_vulkan_server = static_library(
   'lib_vulkan_server',
   files_lib_vulkan_server,
@@ -71,8 +80,6 @@ lib_vulkan_server = static_library(
     inc_cereal,
     inc_common_base,
     inc_common_utils,
-    inc_gl_openglesdispatch,
-    inc_gl_server,
     inc_glm,
     inc_host_backend,
     inc_host_compressed_textures,
@@ -94,7 +101,7 @@ lib_vulkan_server = static_library(
     inc_stream_servers,
     inc_vulkan_headers,
     inc_vulkan_server,
-  ],
+  ] + additional_includes,
   link_with: [
     lib_common_base,
     lib_emulated_textures,

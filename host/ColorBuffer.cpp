@@ -25,7 +25,9 @@
 namespace gfxstream {
 namespace {
 
+#if GFXSTREAM_ENABLE_HOST_GLES
 using gl::ColorBufferGl;
+#endif
 using vk::ColorBufferVk;
 
 // ColorBufferVk natively supports YUV images. However, ColorBufferGl
@@ -116,6 +118,14 @@ class ColorBuffer::Impl : public LazySnapshotObj<ColorBuffer::Impl> {
     std::unique_ptr<ColorBufferGl> mColorBufferGl;
 #endif
 
+    bool hasColorBuffer() const {
+#if GFXSTREAM_ENABLE_HOST_GLES
+        return mColorBufferGl || mColorBufferVk;
+#else
+        return mColorBufferVk != nullptr;
+#endif
+    };
+
     // If Vk emulation is enabled.
     std::unique_ptr<ColorBufferVk> mColorBufferVk;
 
@@ -161,7 +171,11 @@ std::unique_ptr<ColorBuffer::Impl> ColorBuffer::Impl::create(
 #endif
 
     if (emulationVk) {
+#if GFXSTREAM_ENABLE_HOST_GLES
         const bool vulkanOnly = colorBuffer->mColorBufferGl == nullptr;
+#else
+        const bool vulkanOnly = true;
+#endif
         const uint32_t memoryProperty = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
         const uint32_t mipLevels = 1;
         colorBuffer->mColorBufferVk =
@@ -423,9 +437,11 @@ std::unique_ptr<BorrowedImageInfo> ColorBuffer::Impl::borrowForDisplay(UsedApi a
 }
 
 bool ColorBuffer::Impl::flushFromGl() {
+#if GFXSTREAM_ENABLE_HOST_GLES
     if (!(mColorBufferGl && mColorBufferVk)) {
         return true;
     }
+#endif
 
     if (mGlAndVkAreSharingExternalMemory) {
         return true;
@@ -438,9 +454,15 @@ bool ColorBuffer::Impl::flushFromGl() {
 }
 
 bool ColorBuffer::Impl::flushFromVk() {
+#if GFXSTREAM_ENABLE_HOST_GLES
     if (!(mColorBufferGl && mColorBufferVk)) {
         return true;
     }
+#else
+    if (!mColorBufferVk) {
+        return true;
+    }
+#endif
 
     if (mGlAndVkAreSharingExternalMemory) {
         return true;
@@ -466,9 +488,11 @@ bool ColorBuffer::Impl::flushFromVk() {
 }
 
 bool ColorBuffer::Impl::flushFromVkBytes(const void* bytes, size_t bytesSize) {
+#if GFXSTREAM_ENABLE_HOST_GLES
     if (!(mColorBufferGl && mColorBufferVk)) {
         return true;
     }
+#endif
 
     if (mGlAndVkAreSharingExternalMemory) {
         return true;
@@ -487,9 +511,11 @@ bool ColorBuffer::Impl::flushFromVkBytes(const void* bytes, size_t bytesSize) {
 }
 
 bool ColorBuffer::Impl::invalidateForGl() {
+#if GFXSTREAM_ENABLE_HOST_GLES
     if (!(mColorBufferGl && mColorBufferVk)) {
         return true;
     }
+#endif
 
     if (mGlAndVkAreSharingExternalMemory) {
         return true;
@@ -501,9 +527,11 @@ bool ColorBuffer::Impl::invalidateForGl() {
 }
 
 bool ColorBuffer::Impl::invalidateForVk() {
+#if GFXSTREAM_ENABLE_HOST_GLES
     if (!(mColorBufferGl && mColorBufferVk)) {
         return true;
     }
+#endif
 
     if (mGlAndVkAreSharingExternalMemory) {
         return true;

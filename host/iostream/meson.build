@@ -4,6 +4,7 @@
 inc_host_iostream = include_directories('include')
 
 files_lib_host_iostream = files(
+  'dummy.c'
 )
 
 lib_host_iostream = static_library(

@@ -32,6 +32,10 @@ else
   files_lib_common_base += 'Thread_pthread.cpp'
 endif
 
+if host_machine.system() == 'darwin'
+  files_lib_common_base += 'system-native-mac.mm'
+endif
+
 lib_common_base = static_library(
   'common_base',
   files_lib_common_base,
