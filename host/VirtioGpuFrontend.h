@@ -79,7 +79,7 @@ class VirtioGpuFrontend {
     int transferWriteIov(int resId, uint64_t offset, stream_renderer_box* box, struct iovec* iov,
                          int iovec_cnt);
 
-    void getCapset(uint32_t set, uint32_t* max_size);
+    void getCapset(uint32_t set, uint32_t* max_ver, uint32_t* max_size);
     void fillCaps(uint32_t set, void* caps);
 
     void attachResource(uint32_t ctxId, uint32_t resId);
