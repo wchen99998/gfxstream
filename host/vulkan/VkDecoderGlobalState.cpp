@@ -2247,8 +2247,18 @@ class VkDecoderGlobalState::Impl {
         if (!deviceInfo.getMemoryHandleFunc) {
             return VK_ERROR_INITIALIZATION_FAILED;
         }
-#elif defined(__linux__) || defined(__APPLE__)
-        // Use vkGetMemoryFdKHR (MoltenVK supports FD export on macOS)
+#elif defined(__APPLE__)
+        // Mirror VkCommonOperations.cpp:1566 — Metal uses its own export path
+        if (m_vkEmulation->supportsExternalMemoryMetal()) {
+            deviceInfo.getMemoryHandleFunc = nullptr;
+        } else {
+            deviceInfo.getMemoryHandleFunc = reinterpret_cast<PFN_vkGetMemoryFdKHR>(
+                vk->vkGetDeviceProcAddr(*pDevice, "vkGetMemoryFdKHR"));
+            if (!deviceInfo.getMemoryHandleFunc) {
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+        }
+#elif defined(__linux__)
         deviceInfo.getMemoryHandleFunc = reinterpret_cast<PFN_vkGetMemoryFdKHR>(
             vk->vkGetDeviceProcAddr(*pDevice, "vkGetMemoryFdKHR"));
         if (!deviceInfo.getMemoryHandleFunc) {
