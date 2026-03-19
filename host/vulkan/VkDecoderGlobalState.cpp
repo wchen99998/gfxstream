@@ -2245,6 +2245,7 @@ class VkDecoderGlobalState::Impl {
         deviceInfo.getMemoryHandleFunc = reinterpret_cast<PFN_vkGetMemoryWin32HandleKHR>(
             vk->vkGetDeviceProcAddr(*pDevice, "vkGetMemoryWin32HandleKHR"));
         if (!deviceInfo.getMemoryHandleFunc) {
+            mDeviceInfo.erase(*pDevice);
             return VK_ERROR_INITIALIZATION_FAILED;
         }
 #elif defined(__APPLE__)
@@ -2255,6 +2256,7 @@ class VkDecoderGlobalState::Impl {
             deviceInfo.getMemoryHandleFunc = reinterpret_cast<PFN_vkGetMemoryFdKHR>(
                 vk->vkGetDeviceProcAddr(*pDevice, "vkGetMemoryFdKHR"));
             if (!deviceInfo.getMemoryHandleFunc) {
+                mDeviceInfo.erase(*pDevice);
                 return VK_ERROR_INITIALIZATION_FAILED;
             }
         }
@@ -2262,6 +2264,7 @@ class VkDecoderGlobalState::Impl {
         deviceInfo.getMemoryHandleFunc = reinterpret_cast<PFN_vkGetMemoryFdKHR>(
             vk->vkGetDeviceProcAddr(*pDevice, "vkGetMemoryFdKHR"));
         if (!deviceInfo.getMemoryHandleFunc) {
+            mDeviceInfo.erase(*pDevice);
             return VK_ERROR_INITIALIZATION_FAILED;
         }
 #endif
@@ -9744,6 +9747,14 @@ class VkDecoderGlobalState::Impl {
     void destroyDeviceObjects(InstanceObjects::DeviceObjects& deviceObjects) {
             VkDevice device = deviceObjects.device.key();
             DeviceInfo& deviceInfo = deviceObjects.device.mapped();
+
+            // Guard against half-initialized device records: if vkCreateDevice
+            // failed after inserting into mDeviceInfo but before assigning boxed,
+            // the dispatch table will be null.  Nothing to tear down in that case.
+            if (!deviceInfo.boxed) {
+                return;
+            }
+
             VulkanDispatch* deviceDispatch = dispatch_VkDevice(deviceInfo.boxed);
 
             // https://bugs.chromium.org/p/chromium/issues/detail?id=1074600
