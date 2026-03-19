@@ -555,7 +555,11 @@ int VirtioGpuFrontend::transferWriteIov(int resId, uint64_t offset, stream_rende
     return resource.TransferWrite(offset, box, AsVecOption(iov, iovec_cnt));
 }
 
-void VirtioGpuFrontend::getCapset(uint32_t set, uint32_t* max_size) {
+void VirtioGpuFrontend::getCapset(uint32_t set, uint32_t* max_ver, uint32_t* max_size) {
+    if (max_ver) {
+        *max_ver = 1;
+    }
+
     switch (set) {
         case VIRTGPU_CAPSET_GFXSTREAM_VULKAN:
             *max_size = sizeof(struct gfxstream::vulkanCapset);
@@ -567,6 +571,9 @@ void VirtioGpuFrontend::getCapset(uint32_t set, uint32_t* max_size) {
             *max_size = sizeof(struct gfxstream::composerCapset);
             break;
         default:
+            if (max_ver) {
+                *max_ver = 0;
+            }
             GFXSTREAM_ERROR("Incorrect capability set specified (%u)", set);
     }
 }
