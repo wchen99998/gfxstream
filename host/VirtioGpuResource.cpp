@@ -287,7 +287,7 @@ std::optional<VirtioGpuResource> VirtioGpuResource::Create(
     } else if (features.ExternalBlob.enabled) {
         if (createBlobArgs->blob_mem == STREAM_BLOB_MEM_GUEST &&
             (createBlobArgs->blob_flags & STREAM_BLOB_FLAG_CREATE_GUEST_HANDLE)) {
-#if defined(__linux__) || defined(__QNX__)
+#if defined(__linux__) || defined(__QNX__) || defined(__APPLE__)
             ManagedDescriptor managedHandle(handle->os_handle);
             ExternalObjectManager::get()->addBlobDescriptorInfo(
                 contextId, createBlobArgs->blob_id, std::move(managedHandle), handle->handle_type,
