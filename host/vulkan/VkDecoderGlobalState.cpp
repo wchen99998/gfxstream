@@ -2247,8 +2247,8 @@ class VkDecoderGlobalState::Impl {
         if (!deviceInfo.getMemoryHandleFunc) {
             return VK_ERROR_INITIALIZATION_FAILED;
         }
-#elif __linux__
-        // Use vkGetMemoryFdKHR
+#elif defined(__linux__) || defined(__APPLE__)
+        // Use vkGetMemoryFdKHR (MoltenVK supports FD export on macOS)
         deviceInfo.getMemoryHandleFunc = reinterpret_cast<PFN_vkGetMemoryFdKHR>(
             vk->vkGetDeviceProcAddr(*pDevice, "vkGetMemoryFdKHR"));
         if (!deviceInfo.getMemoryHandleFunc) {
@@ -3376,7 +3376,7 @@ class VkDecoderGlobalState::Impl {
         };
 
         return vk->vkGetSemaphoreWin32HandleKHR(device, &getWin32, outHandle);
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__APPLE__)
         VkExternalSemaphoreHandleTypeFlagBits handleTypeBits =
             VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
         if (handleType) {
@@ -9308,6 +9308,7 @@ class VkDecoderGlobalState::Impl {
             // Use memory_fd if external memory metal is not supported (software rendering path)
             hostAlwaysDeviceExtensions.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
         }
+        hostAlwaysDeviceExtensions.push_back(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
 #endif
 
 #if defined(__linux__)
@@ -9479,7 +9480,7 @@ class VkDecoderGlobalState::Impl {
                                                             VkDeviceMemory memory) {
         GenericDescriptorInfo ret;
 
-#if defined(__unix__)
+#if defined(__unix__) || defined(__APPLE__)
         VkMemoryGetFdInfoKHR memoryGetFdInfo = {
             .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
             .pNext = nullptr,
