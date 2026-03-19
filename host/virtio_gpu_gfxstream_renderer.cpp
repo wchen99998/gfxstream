@@ -128,7 +128,11 @@ ParseGfxstreamFeatures(const int rendererFlags,
     // udmabuf requires ExternalBlob feature.
     GFXSTREAM_SET_FEATURE_ON_CONDITION(&features, ExternalBlob,
                                        rendererFlags & STREAM_RENDERER_FLAGS_USE_EXTERNAL_BLOB ||
-                                           features.VulkanAllocateHostVisibleAsUdmabuf.enabled);
+                                           features.VulkanAllocateHostVisibleAsUdmabuf.enabled
+#if defined(__APPLE__)
+                                           || true  // macOS: enable ExternalBlob for blob resource sharing
+#endif
+                                       );
     GFXSTREAM_SET_FEATURE_ON_CONDITION(&features, VulkanEnsureCachedCoherentMemoryAvailable, true);
 
     for (const std::string& rendererFeature : gfxstream::Split(rendererFeatures, ",;")) {
