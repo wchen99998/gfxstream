@@ -2263,6 +2263,21 @@ class VkDecoderGlobalState::Impl {
         deviceInfo.externalFenceInfo.supportedBinarySemaphoreHandleTypes =
             static_cast<VkExternalSemaphoreHandleTypeFlagBits>(supportedBinarySemaphoreHandleTypes);
 
+#ifdef _WIN32
+        // Use vkGetMemoryWin32HandleKHR
+        deviceInfo.getMemoryHandleFunc = reinterpret_cast<PFN_vkGetMemoryWin32HandleKHR>(
+            vk->vkGetDeviceProcAddr(*pDevice, "vkGetMemoryWin32HandleKHR"));
+        if (!deviceInfo.getMemoryHandleFunc) {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+#elif defined(__linux__) || defined(__APPLE__)
+        // Use vkGetMemoryFdKHR (MoltenVK supports FD export on macOS)
+        deviceInfo.getMemoryHandleFunc = reinterpret_cast<PFN_vkGetMemoryFdKHR>(
+            vk->vkGetDeviceProcAddr(*pDevice, "vkGetMemoryFdKHR"));
+        if (!deviceInfo.getMemoryHandleFunc) {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+#endif
         GFXSTREAM_INFO(
             "Created VkDevice:%p for application:'%s' instance:%p. ASTC emulation:%s CPU decoding:%s.",
             *pDevice, instanceInfo.applicationName.c_str(), physicalDeviceInfo.instance,
@@ -3386,7 +3401,7 @@ class VkDecoderGlobalState::Impl {
         };
 
         return vk->vkGetSemaphoreWin32HandleKHR(device, &getWin32, outHandle);
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__APPLE__)
         VkExternalSemaphoreHandleTypeFlagBits handleTypeBits =
             VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
         if (handleType) {
@@ -9362,6 +9377,7 @@ class VkDecoderGlobalState::Impl {
         if (m_vkEmulation->supportsPortabilityEnumeration()) {
             hostAlwaysDeviceExtensions.push_back(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
         }
+        hostAlwaysDeviceExtensions.push_back(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
 #endif
 
 #if defined(__linux__)
@@ -9555,7 +9571,7 @@ class VkDecoderGlobalState::Impl {
 
         const auto extMemMode = m_vkEmulation->getExternalMemoryMode();
         switch (extMemMode) {
-#if defined(__unix__) && !defined(__ANDROID__)
+#if (defined(__unix__) || defined(__APPLE__)) && !defined(__ANDROID__)
             case ExternalMemory::Mode::OpaqueFd: {
                 if (!vk->vkGetMemoryFdKHR) {
                     GFXSTREAM_ERROR("%s: External memory function not supported.", __func__);

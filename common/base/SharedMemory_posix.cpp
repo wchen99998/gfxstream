@@ -109,6 +109,15 @@ int SharedMemory::openInternal(int oflag, int mode, bool doMapping) {
     if (mShareType == ShareType::SHARED_MEMORY) {
 #if defined(HAVE_MEMFD_CREATE)
         mFd = memfd_create(mName.c_str(), MFD_CLOEXEC | MFD_ALLOW_SEALING);
+#elif defined(__APPLE__)
+        // macOS: use shm_open + immediate unlink for anonymous shared memory.
+        // After unlink the backing is kernel-managed with no filesystem I/O.
+        std::string shmName = "/" + mName;
+        mFd = shm_open(shmName.c_str(), O_CREAT | O_RDWR, mode);
+        if (mFd != -1) {
+            shm_unlink(shmName.c_str());
+            fcntl(mFd, F_SETFD, FD_CLOEXEC);
+        }
 #else
         mFd = syscall(__NR_memfd_create, mName.c_str(), FD_CLOEXEC);
 #endif
