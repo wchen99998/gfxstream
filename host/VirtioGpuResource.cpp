@@ -301,12 +301,19 @@ std::optional<VirtioGpuResource> VirtioGpuResource::Create(
                 descriptorInfoOpt = ExternalObjectManager::get()->removeBlobDescriptorInfo(
                     contextId, createBlobArgs->blob_id);
             }
-            if (!descriptorInfoOpt) {
-                GFXSTREAM_ERROR("Failed to create blob: no external blob descriptor.");
-                return std::nullopt;
+            if (descriptorInfoOpt) {
+                resource.mBlobMemory.emplace(
+                    std::make_shared<BlobDescriptorInfo>(std::move(*descriptorInfoOpt)));
+            } else {
+                auto memoryMappingOpt =
+                    ExternalObjectManager::get()->removeMapping(contextId, createBlobArgs->blob_id);
+                if (!memoryMappingOpt) {
+                    GFXSTREAM_ERROR(
+                        "Failed to create blob: no external blob descriptor or mapping.");
+                    return std::nullopt;
+                }
+                resource.mBlobMemory.emplace(std::move(*memoryMappingOpt));
             }
-            resource.mBlobMemory.emplace(
-                std::make_shared<BlobDescriptorInfo>(std::move(*descriptorInfoOpt)));
         }
     } else {
         auto memoryMappingOpt =
@@ -466,14 +473,20 @@ int VirtioGpuResource::GetVulkanInfo(struct stream_renderer_vulkan_info* outInfo
     if (!mBlobMemory) {
         return -EINVAL;
     }
-    if (!std::holds_alternative<ExternalMemoryInfo>(*mBlobMemory)) {
+    std::optional<VulkanInfo> memoryVulkanInfoOpt;
+    if (std::holds_alternative<ExternalMemoryInfo>(*mBlobMemory)) {
+        auto& memory = std::get<ExternalMemoryInfo>(*mBlobMemory);
+        memoryVulkanInfoOpt = memory->vulkanInfoOpt;
+    } else if (std::holds_alternative<ExternalMemoryMapping>(*mBlobMemory)) {
+        auto& memory = std::get<ExternalMemoryMapping>(*mBlobMemory);
+        memoryVulkanInfoOpt = memory.vulkanInfoOpt;
+    } else {
         return -EINVAL;
     }
-    auto& memory = std::get<ExternalMemoryInfo>(*mBlobMemory);
-    if (!memory->vulkanInfoOpt) {
+    if (!memoryVulkanInfoOpt) {
         return -EINVAL;
     }
-    auto& memoryVulkanInfo = *memory->vulkanInfoOpt;
+    auto& memoryVulkanInfo = *memoryVulkanInfoOpt;
 
     outInfo->memory_index = memoryVulkanInfo.memoryIndex;
     memcpy(outInfo->device_id.device_uuid, memoryVulkanInfo.deviceUUID,

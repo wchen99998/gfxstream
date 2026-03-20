@@ -26,10 +26,12 @@ static ExternalObjectManager* sMapping() {
 ExternalObjectManager* ExternalObjectManager::get() { return sMapping(); }
 
 void ExternalObjectManager::addMapping(uint32_t ctxId, uint64_t blobId, void* addr,
-                                       uint32_t caching) {
+                                       uint32_t caching,
+                                       std::optional<VulkanInfo> vulkanInfoOpt) {
     struct HostMemInfo info = {
         .addr = addr,
         .caching = caching,
+        .vulkanInfoOpt = vulkanInfoOpt,
     };
 
     auto key = std::make_pair(ctxId, blobId);

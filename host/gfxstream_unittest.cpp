@@ -14,8 +14,11 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+#include <cstring>
 #include <vector>
 
+#include "VirtioGpuResource.h"
 #include "VirtioGpuFormatUtils.h"
 #include "gfxstream/host/testing/OSWindow.h"
 #include "gfxstream/system/System.h"
@@ -202,4 +205,57 @@ TEST_F(GfxStreamBackendTest, MissingRequiredParameter) {
     // Initialize once more for the teardown function.
     int initResult = stream_renderer_init(streamRendererParams.data(), streamRendererParams.size());
     EXPECT_EQ(initResult, 0);
+}
+
+TEST(VirtioGpuResourceTest, ExternalBlobFallsBackToHostMappingWhenDescriptorMissing) {
+    constexpr uint32_t kContextId = 7;
+    constexpr uint32_t kResourceId = 11;
+    constexpr uint64_t kBlobId = 13;
+    constexpr uint64_t kBlobSize = 4096;
+
+    gfxstream::host::FeatureSet features;
+    features.ExternalBlob.enabled = true;
+
+    int backingStorage = 0;
+    gfxstream::VulkanInfo vulkanInfo = {
+        .memoryIndex = 5,
+    };
+    for (size_t i = 0; i < std::size(vulkanInfo.deviceUUID); ++i) {
+        vulkanInfo.deviceUUID[i] = static_cast<uint8_t>(i + 1);
+        vulkanInfo.driverUUID[i] = static_cast<uint8_t>(i + 17);
+    }
+
+    gfxstream::ExternalObjectManager::get()->addMapping(
+        kContextId, kBlobId, &backingStorage, gfxstream::MAP_CACHE_CACHED, vulkanInfo);
+
+    const stream_renderer_create_blob createBlob = {
+        .blob_mem = STREAM_BLOB_MEM_HOST3D,
+        .blob_flags = 0,
+        .blob_id = kBlobId,
+        .size = kBlobSize,
+    };
+    auto resourceOpt = gfxstream::host::VirtioGpuResource::Create(
+        features, 4096, kContextId, kResourceId, nullptr, &createBlob, nullptr);
+    ASSERT_TRUE(resourceOpt.has_value());
+
+    auto& resource = *resourceOpt;
+    void* mappedAddress = nullptr;
+    uint64_t mappedSize = 0;
+    EXPECT_EQ(resource.Map(&mappedAddress, &mappedSize), 0);
+    EXPECT_EQ(mappedAddress, &backingStorage);
+    EXPECT_EQ(mappedSize, kBlobSize);
+
+    uint32_t caching = 0;
+    EXPECT_EQ(resource.GetCaching(&caching), 0);
+    EXPECT_EQ(caching, gfxstream::MAP_CACHE_CACHED);
+
+    stream_renderer_vulkan_info outVulkanInfo = {};
+    ASSERT_EQ(resource.GetVulkanInfo(&outVulkanInfo), 0);
+    EXPECT_EQ(outVulkanInfo.memory_index, vulkanInfo.memoryIndex);
+    EXPECT_EQ(std::memcmp(outVulkanInfo.device_id.device_uuid, vulkanInfo.deviceUUID,
+                          sizeof(vulkanInfo.deviceUUID)),
+              0);
+    EXPECT_EQ(std::memcmp(outVulkanInfo.device_id.driver_uuid, vulkanInfo.driverUUID,
+                          sizeof(vulkanInfo.driverUUID)),
+              0);
 }
