@@ -301,12 +301,21 @@ std::optional<VirtioGpuResource> VirtioGpuResource::Create(
                 descriptorInfoOpt = ExternalObjectManager::get()->removeBlobDescriptorInfo(
                     contextId, createBlobArgs->blob_id);
             }
-            if (!descriptorInfoOpt) {
-                GFXSTREAM_ERROR("Failed to create blob: no external blob descriptor.");
-                return std::nullopt;
+            if (descriptorInfoOpt) {
+                resource.mBlobMemory.emplace(
+                    std::make_shared<BlobDescriptorInfo>(std::move(*descriptorInfoOpt)));
+            } else {
+                // Fallback: check for a host-mapped pointer (used on macOS/Metal where
+                // VkDeviceMemory is mapped via vkMapMemory instead of exported as an fd).
+                auto memoryMappingOpt = ExternalObjectManager::get()->removeMapping(
+                    contextId, createBlobArgs->blob_id);
+                if (!memoryMappingOpt) {
+                    GFXSTREAM_ERROR(
+                        "Failed to create blob: no external blob descriptor or mapping.");
+                    return std::nullopt;
+                }
+                resource.mBlobMemory.emplace(std::move(*memoryMappingOpt));
             }
-            resource.mBlobMemory.emplace(
-                std::make_shared<BlobDescriptorInfo>(std::move(*descriptorInfoOpt)));
         }
     } else {
         auto memoryMappingOpt =
@@ -466,14 +475,20 @@ int VirtioGpuResource::GetVulkanInfo(struct stream_renderer_vulkan_info* outInfo
     if (!mBlobMemory) {
         return -EINVAL;
     }
-    if (!std::holds_alternative<ExternalMemoryInfo>(*mBlobMemory)) {
+    std::optional<VulkanInfo> memoryVulkanInfoOpt;
+    if (std::holds_alternative<ExternalMemoryInfo>(*mBlobMemory)) {
+        auto& memory = std::get<ExternalMemoryInfo>(*mBlobMemory);
+        memoryVulkanInfoOpt = memory->vulkanInfoOpt;
+    } else if (std::holds_alternative<ExternalMemoryMapping>(*mBlobMemory)) {
+        auto& memory = std::get<ExternalMemoryMapping>(*mBlobMemory);
+        memoryVulkanInfoOpt = memory.vulkanInfoOpt;
+    } else {
         return -EINVAL;
     }
-    auto& memory = std::get<ExternalMemoryInfo>(*mBlobMemory);
-    if (!memory->vulkanInfoOpt) {
+    if (!memoryVulkanInfoOpt) {
         return -EINVAL;
     }
-    auto& memoryVulkanInfo = *memory->vulkanInfoOpt;
+    auto& memoryVulkanInfo = *memoryVulkanInfoOpt;
 
     outInfo->memory_index = memoryVulkanInfo.memoryIndex;
     memcpy(outInfo->device_id.device_uuid, memoryVulkanInfo.deviceUUID,
@@ -660,6 +675,18 @@ int VirtioGpuResource::ReadFromColorBufferToLinear(uint64_t offset, stream_rende
                                                  mCreateArgs->height, mLinear.data(),
                                                  mLinear.size());
     } else {
+        // On non-interop hosts, the scanout color buffer can be current only
+        // in Vulkan. Read directly from Vulkan when available, and fall back
+        // to GL readback on failure to preserve existing behavior elsewhere.
+        if (FrameBuffer::getFB()->hasEmulationVk()) {
+            bool ok = FrameBuffer::getFB()->readColorBufferToBytes(
+                mCreateArgs->handle, 0, 0, mCreateArgs->width, mCreateArgs->height,
+                mLinear.data(), mLinear.size());
+            if (ok) {
+                return 0;
+            }
+        }
+
         FrameBuffer::getFB()->readColorBuffer(mCreateArgs->handle, 0, 0, mCreateArgs->width,
                                               mCreateArgs->height, glformat, gltype,
                                               mLinear.data());

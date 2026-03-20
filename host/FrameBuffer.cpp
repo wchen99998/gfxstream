@@ -575,6 +575,8 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
 
     vk::VkEmulation& getEmulationVk();
     bool hasEmulationVk() const { return m_emulationVk != nullptr; }
+    bool readColorBufferToBytes(HandleType p_colorbuffer, uint32_t x, uint32_t y, uint32_t width,
+                                uint32_t height, void* pixels, uint64_t outPixelsSize);
 
     bool setColorBufferVulkanMode(HandleType colorBufferHandle, uint32_t mode);
     int32_t mapGpaToBufferHandle(uint32_t bufferHandle, uint64_t gpa, uint64_t size);
@@ -4932,6 +4934,24 @@ bool FrameBuffer::hasEmulationGl() const { return mImpl->hasEmulationGl(); }
 #endif
 
 bool FrameBuffer::hasEmulationVk() const { return mImpl->hasEmulationVk(); }
+
+bool FrameBuffer::Impl::readColorBufferToBytes(HandleType p_colorbuffer, uint32_t x, uint32_t y,
+                                               uint32_t width, uint32_t height, void* pixels,
+                                               uint64_t outPixelsSize) {
+    if (!m_emulationVk) {
+        return false;
+    }
+
+    return m_emulationVk->readColorBufferToBytes(p_colorbuffer, x, y, width, height, pixels,
+                                                 outPixelsSize);
+}
+
+bool FrameBuffer::readColorBufferToBytes(HandleType p_colorbuffer, uint32_t x, uint32_t y,
+                                         uint32_t width, uint32_t height, void* pixels,
+                                         uint64_t outPixelsSize) {
+    return mImpl->readColorBufferToBytes(p_colorbuffer, x, y, width, height, pixels,
+                                         outPixelsSize);
+}
 
 bool FrameBuffer::setColorBufferVulkanMode(HandleType colorBufferHandle, uint32_t mode) {
     return mImpl->setColorBufferVulkanMode(colorBufferHandle, mode);

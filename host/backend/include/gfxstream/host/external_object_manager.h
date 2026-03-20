@@ -52,6 +52,7 @@ namespace gfxstream {
 #define STREAM_HANDLE_TYPE_MEM_OPAQUE_WIN32 0x3
 #define STREAM_HANDLE_TYPE_MEM_SHM 0x4
 #define STREAM_HANDLE_TYPE_MEM_ZIRCON 0x5
+#define STREAM_HANDLE_TYPE_MEM_MTL_HANDLE 0x6
 
 #define STREAM_HANDLE_TYPE_SIGNAL_OPAQUE_FD 0x10
 #define STREAM_HANDLE_TYPE_SIGNAL_SYNC_FD 0x20
@@ -81,22 +82,23 @@ struct ExternalHandleInfo {
 #endif
 };
 
+struct VulkanInfo {
+    uint32_t memoryIndex;
+    uint8_t deviceUUID[16];
+    uint8_t driverUUID[16];
+};
+
 // A struct describing the information about host memory associated
 // with a host memory id. Used with virtio-gpu-next.
 struct HostMemInfo {
     void* addr;
     uint32_t caching;
+    std::optional<VulkanInfo> vulkanInfoOpt;
 };
 
 struct GenericDescriptorInfo {
     ManagedDescriptor descriptor;
     uint32_t streamHandleType;
-};
-
-struct VulkanInfo {
-    uint32_t memoryIndex;
-    uint8_t deviceUUID[16];
-    uint8_t driverUUID[16];
 };
 
 struct BlobDescriptorInfo {
@@ -113,7 +115,8 @@ class ExternalObjectManager {
 
     static ExternalObjectManager* get();
 
-    void addMapping(uint32_t ctx_id, uint64_t blobId, void* addr, uint32_t caching);
+    void addMapping(uint32_t ctx_id, uint64_t blobId, void* addr, uint32_t caching,
+                    std::optional<VulkanInfo> vulkanInfoOpt = std::nullopt);
     std::optional<HostMemInfo> removeMapping(uint32_t ctx_id, uint64_t blobId);
 
     void addBlobDescriptorInfo(uint32_t ctx_id, uint64_t blobId, ManagedDescriptor descriptor,
