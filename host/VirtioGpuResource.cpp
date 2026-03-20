@@ -301,12 +301,21 @@ std::optional<VirtioGpuResource> VirtioGpuResource::Create(
                 descriptorInfoOpt = ExternalObjectManager::get()->removeBlobDescriptorInfo(
                     contextId, createBlobArgs->blob_id);
             }
-            if (!descriptorInfoOpt) {
-                GFXSTREAM_ERROR("Failed to create blob: no external blob descriptor.");
-                return std::nullopt;
+            if (descriptorInfoOpt) {
+                resource.mBlobMemory.emplace(
+                    std::make_shared<BlobDescriptorInfo>(std::move(*descriptorInfoOpt)));
+            } else {
+                // Fallback: check for a host-mapped pointer (used on macOS/Metal where
+                // VkDeviceMemory is mapped via vkMapMemory instead of exported as an fd).
+                auto memoryMappingOpt = ExternalObjectManager::get()->removeMapping(
+                    contextId, createBlobArgs->blob_id);
+                if (!memoryMappingOpt) {
+                    GFXSTREAM_ERROR(
+                        "Failed to create blob: no external blob descriptor or mapping.");
+                    return std::nullopt;
+                }
+                resource.mBlobMemory.emplace(std::move(*memoryMappingOpt));
             }
-            resource.mBlobMemory.emplace(
-                std::make_shared<BlobDescriptorInfo>(std::move(*descriptorInfoOpt)));
         }
     } else {
         auto memoryMappingOpt =

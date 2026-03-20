@@ -6699,7 +6699,37 @@ class VkDecoderGlobalState::Impl {
         } else if (m_vkEmulation->getFeatures().ExternalBlob.enabled) {
 #ifdef __APPLE__
             if (m_vkEmulation->supportsExternalMemoryMetal()) {
-                GFXSTREAM_FATAL("ExternalBlob feature is not supported with external memory metal");
+                // On macOS with MoltenVK, Metal memory cannot be exported as POSIX file
+                // descriptors. Instead, map the VkDeviceMemory directly via vkMapMemory
+                // (backed by MTLBuffer in shared storage mode) and provide the host pointer
+                // through the mapping path so stream_renderer_resource_map() works.
+                VkResult mapResult =
+                    vk->vkMapMemory(device, memory, 0, info->size, 0, &info->ptr);
+                if (mapResult != VK_SUCCESS) {
+                    GFXSTREAM_ERROR(
+                        "Failed to map VkDeviceMemory for Metal external blob: %s",
+                        string_VkResult(mapResult));
+                    return VK_ERROR_OUT_OF_HOST_MEMORY;
+                }
+                info->needUnmap = true;
+
+                uint64_t hva = (uint64_t)(uintptr_t)(info->ptr);
+                uint64_t alignedHva = hva & kPageMaskForBlob;
+
+                if (hva != alignedHva) {
+                    GFXSTREAM_ERROR(
+                        "Mapping non page-size (0x%" PRIx64
+                        ") aligned host virtual address:%p "
+                        "using the aligned host virtual address:%p. The underlying resources "
+                        "using this blob may be corrupted/offset.",
+                        kPageSizeforBlob, hva, alignedHva);
+                }
+                ExternalObjectManager::get()->addMapping(virtioGpuContextId, hostBlobId,
+                                                         (void*)(uintptr_t)alignedHva,
+                                                         info->caching);
+                info->virtioGpuMapped = true;
+                info->hostmemId = hostBlobId;
+                return VK_SUCCESS;
             }
 #endif
 
