@@ -433,6 +433,8 @@ class FrameBuffer : public gfxstream::base::EventNotificationSupport<FrameBuffer
 
     bool hasEmulationGl() const;
     bool hasEmulationVk() const;
+    bool readColorBufferToBytes(HandleType p_colorbuffer, uint32_t x, uint32_t y, uint32_t width,
+                                uint32_t height, void* pixels, uint64_t outPixelsSize);
 
     bool setColorBufferVulkanMode(HandleType colorBufferHandle, uint32_t mode);
     int32_t mapGpaToBufferHandle(uint32_t bufferHandle, uint64_t gpa, uint64_t size = 0);
