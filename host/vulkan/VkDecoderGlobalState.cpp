@@ -6686,6 +6686,7 @@ class VkDecoderGlobalState::Impl {
         if (!deviceInfo) return VK_ERROR_OUT_OF_HOST_MEMORY;
 
         hostBlobId = (info->blobId && !hostBlobId) ? info->blobId : hostBlobId;
+        std::optional<VulkanInfo> mappingVulkanInfoOpt;
 
         if ((m_vkEmulation->getFeatures().SystemBlob.enabled ||
              m_vkEmulation->getFeatures().VulkanAllocateHostVisibleAsUdmabuf.enabled) &&
@@ -6697,12 +6698,6 @@ class VkDecoderGlobalState::Impl {
                 virtioGpuContextId, hostBlobId, info->sharedMemory->releaseHandle(),
                 STREAM_HANDLE_TYPE_MEM_SHM, info->caching, std::nullopt);
         } else if (m_vkEmulation->getFeatures().ExternalBlob.enabled) {
-#ifdef __APPLE__
-            if (m_vkEmulation->supportsExternalMemoryMetal()) {
-                GFXSTREAM_FATAL("ExternalBlob feature is not supported with external memory metal");
-            }
-#endif
-
             struct VulkanInfo vulkanInfo = {
                 .memoryIndex = info->memoryIndex,
             };
@@ -6716,7 +6711,14 @@ class VkDecoderGlobalState::Impl {
                 memcpy(vulkanInfo.driverUUID, driverUuidOpt->data(), sizeof(vulkanInfo.driverUUID));
             }
 
-            if (snapshotsEnabled()) {
+            mappingVulkanInfoOpt = vulkanInfo;
+
+            bool needsHostMapping = snapshotsEnabled();
+#ifdef __APPLE__
+            needsHostMapping = needsHostMapping || m_vkEmulation->supportsExternalMemoryMetal();
+#endif
+
+            if (needsHostMapping && !info->ptr) {
                 VkResult mapResult = vk->vkMapMemory(device, memory, 0, info->size, 0, &info->ptr);
                 if (mapResult != VK_SUCCESS) {
                     return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -6725,15 +6727,21 @@ class VkDecoderGlobalState::Impl {
                 info->needUnmap = true;
             }
 
-            auto exportedMemoryOpt = exportMemoryHandle(deviceInfo, vk, device, memory);
-            if (!exportedMemoryOpt) {
-                return VK_ERROR_OUT_OF_HOST_MEMORY;
+#if defined(__APPLE__)
+            if (!m_vkEmulation->supportsExternalMemoryMetal()) {
+#endif
+                auto exportedMemoryOpt = exportMemoryHandle(deviceInfo, vk, device, memory);
+                if (!exportedMemoryOpt) {
+                    return VK_ERROR_OUT_OF_HOST_MEMORY;
+                }
+                auto& exportedMemory = *exportedMemoryOpt;
+                ExternalObjectManager::get()->addBlobDescriptorInfo(
+                    virtioGpuContextId, hostBlobId, std::move(exportedMemory.descriptor),
+                    exportedMemory.streamHandleType, info->caching,
+                    std::optional<VulkanInfo>(vulkanInfo));
+#if defined(__APPLE__)
             }
-            auto& exportedMemory = *exportedMemoryOpt;
-            ExternalObjectManager::get()->addBlobDescriptorInfo(
-                virtioGpuContextId, hostBlobId, std::move(exportedMemory.descriptor),
-                exportedMemory.streamHandleType, info->caching,
-                std::optional<VulkanInfo>(vulkanInfo));
+#endif
         } else if (!info->needUnmap) {
             VkResult mapResult = vk->vkMapMemory(device, memory, 0, info->size, 0, &info->ptr);
             if (mapResult != VK_SUCCESS) {
@@ -6756,7 +6764,8 @@ class VkDecoderGlobalState::Impl {
                     kPageSizeforBlob, hva, alignedHva);
             }
             ExternalObjectManager::get()->addMapping(virtioGpuContextId, hostBlobId,
-                                                     (void*)(uintptr_t)alignedHva, info->caching);
+                                                     (void*)(uintptr_t)alignedHva, info->caching,
+                                                     std::move(mappingVulkanInfoOpt));
             info->virtioGpuMapped = true;
             info->hostmemId = hostBlobId;
         }

@@ -784,11 +784,6 @@ int VirtioGpuFrontend::createBlob(uint32_t contextId, uint32_t resourceId,
 int VirtioGpuFrontend::resourceMap(uint32_t resourceId, void** hvaOut, uint64_t* sizeOut) {
     GFXSTREAM_DEBUG("resource: %u", resourceId);
 
-    if (mFeatures.ExternalBlob.enabled) {
-        GFXSTREAM_ERROR("Failed to map resource: external blob enabled.");
-        return -EINVAL;
-    }
-
     auto it = mResources.find(resourceId);
     if (it == mResources.end()) {
         if (hvaOut) *hvaOut = nullptr;
