@@ -2733,6 +2733,22 @@ bool VkEmulation::createVkColorBufferLocked(uint32_t width, uint32_t height,
     mColorBuffers[colorBufferHandle] = res;
     auto infoPtr = &mColorBuffers[colorBufferHandle];
 
+    // Rollback helper: mirrors teardownVkColorBufferLocked() destroy order
+    // (imageView -> image -> freeExternalMemoryLocked -> erase) but skips
+    // vkQueueWaitIdle because no work has been submitted during creation.
+    auto cleanupOnFailure = [&]() {
+        auto vk = mDvk;
+        if (infoPtr->imageView != VK_NULL_HANDLE) {
+            vk->vkDestroyImageView(mDevice, infoPtr->imageView, nullptr);
+        }
+        if (infoPtr->image != VK_NULL_HANDLE) {
+            vk->vkDestroyImage(mDevice, infoPtr->image, nullptr);
+        }
+        if (infoPtr->memory.memory != VK_NULL_HANDLE) {
+            freeExternalMemoryLocked(vk, &infoPtr->memory);
+        }
+        mColorBuffers.erase(colorBufferHandle);
+    };
     VkImageTiling tiling = (infoPtr->memoryProperty & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
                                ? VK_IMAGE_TILING_LINEAR
                                : VK_IMAGE_TILING_OPTIMAL;
@@ -2741,6 +2757,7 @@ bool VkEmulation::createVkColorBufferLocked(uint32_t width, uint32_t height,
     // pNext will be filled later.
     if (imageCi == nullptr) {
         // it can happen if the format is not supported
+        cleanupOnFailure();
         return false;
     }
     imageCi->sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -2767,6 +2784,7 @@ bool VkEmulation::createVkColorBufferLocked(uint32_t width, uint32_t height,
     if (createRes != VK_SUCCESS) {
         GFXSTREAM_ERROR("Failed to create Vulkan image for ColorBuffer %d, error: %s",
                         colorBufferHandle, string_VkResult(createRes));
+        cleanupOnFailure();
         return false;
     }
 
@@ -2820,6 +2838,7 @@ bool VkEmulation::createVkColorBufferLocked(uint32_t width, uint32_t height,
                                         deviceAlignment, kNullopt, dedicatedImage, infoPtr);
     if (!allocRes) {
         GFXSTREAM_ERROR("Failed to allocate ColorBuffer with Vulkan backing.");
+        cleanupOnFailure();
         return false;
     }
 
@@ -2838,6 +2857,7 @@ bool VkEmulation::createVkColorBufferLocked(uint32_t width, uint32_t height,
     if (bindImageMemoryRes != VK_SUCCESS) {
         GFXSTREAM_ERROR("Failed to bind image memory. Error: %s",
                         string_VkResult(bindImageMemoryRes));
+        cleanupOnFailure();
         return false;
     }
 
@@ -2885,6 +2905,7 @@ bool VkEmulation::createVkColorBufferLocked(uint32_t width, uint32_t height,
     if (createRes != VK_SUCCESS) {
         GFXSTREAM_ERROR("Failed to create Vulkan image view for ColorBuffer %d, Error: %s",
                         colorBufferHandle, string_VkResult(createRes));
+        cleanupOnFailure();
         return false;
     }
 
