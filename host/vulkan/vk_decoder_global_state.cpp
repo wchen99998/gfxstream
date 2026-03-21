@@ -3068,7 +3068,8 @@ class VkDecoderGlobalState::Impl {
 
             auto* imageInfo = gfxstream::base::find(mImageInfo, original_underlying_image);
             if (!imageInfo) {
-                GFXSTREAM_ERROR("Image for deferred AHB bind does not exist.");
+                GFXSTREAM_ERROR("Image (handle:%p) for deferred AHB bind does not exist.",
+                                (void*)original_underlying_image);
                 return VK_ERROR_OUT_OF_HOST_MEMORY;
             }
 
@@ -3080,12 +3081,17 @@ class VkDecoderGlobalState::Impl {
             GFXSTREAM_FATAL("Missing VkNativeBufferANDROID for deferred AHB bind.");
         }
 
+        const auto* anb = static_cast<const VkNativeBufferANDROID*>(ici.pNext);
+        uint32_t cbHandle = *static_cast<const uint32_t*>(anb->handle);
+
         VkImage underlying_replacement_image = VK_NULL_HANDLE;
         VkResult result = on_vkCreateImage(pool, apiCallHandle, boxed_device, &ici, nullptr,
                                            &underlying_replacement_image, false);
         if (result != VK_SUCCESS) {
-            GFXSTREAM_ERROR("Failed to create image for deferred AHB bind.");
-            return VK_ERROR_OUT_OF_HOST_MEMORY;
+            GFXSTREAM_ERROR(
+                "Failed to create image for deferred AHB bind (ColorBuffer:%u): %s",
+                cbHandle, string_VkResult(result));
+            return result;
         }
 
         on_vkDestroyImage(pool, apiCallHandle, boxed_device, original_underlying_image, nullptr);
