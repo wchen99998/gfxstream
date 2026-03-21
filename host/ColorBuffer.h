@@ -89,6 +89,8 @@ class ColorBuffer : public LazySnapshotObj<ColorBuffer> {
 
     std::optional<BlobDescriptorInfo> exportBlob();
 
+    bool ensureVkBacking(vk::VkEmulation& vkEmulation);
+
 #if GFXSTREAM_ENABLE_HOST_GLES
     GLuint glOpGetTexture();
     bool glOpBlitFromCurrentReadBuffer();

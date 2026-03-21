@@ -85,6 +85,8 @@ class ColorBuffer::Impl : public LazySnapshotObj<ColorBuffer::Impl> {
 
     std::optional<BlobDescriptorInfo> exportBlob();
 
+    bool ensureVkBacking(vk::VkEmulation& vkEmulation);
+
 #if GFXSTREAM_ENABLE_HOST_GLES
     GLuint glOpGetTexture();
     bool glOpBlitFromCurrentReadBuffer();
@@ -572,6 +574,31 @@ std::optional<BlobDescriptorInfo> ColorBuffer::Impl::exportBlob() {
     return mColorBufferVk->exportBlob();
 }
 
+bool ColorBuffer::Impl::ensureVkBacking(vk::VkEmulation& vkEmulation) {
+    if (mColorBufferVk) {
+        return true;
+    }
+
+#if GFXSTREAM_ENABLE_HOST_GLES
+    const bool vulkanOnly = mColorBufferGl == nullptr;
+#else
+    const bool vulkanOnly = true;
+#endif
+    const uint32_t memoryProperty = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    const uint32_t mipLevels = 1;
+
+    mColorBufferVk = vk::ColorBufferVk::create(vkEmulation, mHandle, mWidth, mHeight, mFormat,
+                                                mFrameworkFormat, vulkanOnly, memoryProperty,
+                                                /*stream=*/nullptr, mipLevels);
+    if (!mColorBufferVk) {
+        GFXSTREAM_ERROR("ensureVkBacking: Failed to lazily create ColorBufferVk for handle:%d",
+                        mHandle);
+        return false;
+    }
+
+    return true;
+}
+
 #if GFXSTREAM_ENABLE_HOST_GLES
 bool ColorBuffer::Impl::glOpBlitFromCurrentReadBuffer() {
     if (!mColorBufferGl) {
@@ -801,6 +828,10 @@ bool ColorBuffer::invalidateForGl() { return mImpl->invalidateForGl(); }
 bool ColorBuffer::invalidateForVk() { return mImpl->invalidateForVk(); }
 
 std::optional<BlobDescriptorInfo> ColorBuffer::exportBlob() { return mImpl->exportBlob(); }
+
+bool ColorBuffer::ensureVkBacking(vk::VkEmulation& vkEmulation) {
+    return mImpl->ensureVkBacking(vkEmulation);
+}
 
 #if GFXSTREAM_ENABLE_HOST_GLES
 GLuint ColorBuffer::glOpGetTexture() { return mImpl->glOpGetTexture(); }
