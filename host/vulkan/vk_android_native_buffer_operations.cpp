@@ -133,8 +133,28 @@ std::unique_ptr<AndroidNativeBufferInfo> AndroidNativeBufferInfo::create(
 
     if (!emu->getColorBufferShareInfo(out->mColorBufferHandle, &colorBufferExportedToGl,
                                       &externalMemoryCompatible)) {
-        VK_ANB_ERR("Failed to query if ColorBuffer:%d exported to GL.", out->mColorBufferHandle);
-        return nullptr;
+        // Share info missing — the ColorBuffer may exist with GL backing only because
+        // ColorBufferVk::create() failed silently during initial creation.  Attempt a
+        // one-shot lazy repair.
+        GFXSTREAM_WARNING(
+            "ColorBuffer:%d share info missing; attempting lazy Vulkan backing repair.",
+            out->mColorBufferHandle);
+
+        auto* fb = gfxstream::FrameBuffer::getFB();
+        if (fb) {
+            auto cb = fb->findColorBuffer(out->mColorBufferHandle);
+            if (cb) {
+                cb->ensureVkBacking(*emu);
+            }
+        }
+
+        // Retry exactly once.
+        if (!emu->getColorBufferShareInfo(out->mColorBufferHandle, &colorBufferExportedToGl,
+                                          &externalMemoryCompatible)) {
+            VK_ANB_ERR("Failed to query if ColorBuffer:%d exported to GL after lazy repair.",
+                       out->mColorBufferHandle);
+            return nullptr;
+        }
     }
 
     if (externalMemoryCompatible) {
