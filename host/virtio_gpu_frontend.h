@@ -17,6 +17,7 @@
 #include <stdint.h>
 
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 
 extern "C" {
@@ -39,6 +40,22 @@ namespace gfxstream {
 namespace host {
 
 class CleanupThread;
+
+struct ScanoutBinding {
+    uint32_t resource_id = 0;  // 0 = unbound
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
+
+struct NativeSurface {
+    void* nativeWindowHandle = nullptr;  // borrowed; NSWindow* on macOS
+    int32_t widthPt = 0;
+    int32_t heightPt = 0;
+    int32_t widthPx = 0;
+    int32_t heightPx = 0;
+    float dpr = 1.0f;
+    bool active = false;
+};
 
 class VirtioGpuFrontend {
    public:
@@ -122,6 +139,23 @@ class VirtioGpuFrontend {
     void setScreenMask(int width, int height, const uint8_t* rgbaData);
     void setScreenBackground(int width, int height, const uint8_t* rgbaData);
 
+    void setNativeWindowEnabled(bool enabled);
+
+    int setupNativeSurface(uint32_t displayId, void* nativeWindowHandle,
+                           int32_t widthPt, int32_t heightPt,
+                           int32_t widthPx, int32_t heightPx,
+                           float dpr);
+    int teardownNativeSurface(uint32_t displayId);
+    int resizeNativeSurface(uint32_t displayId,
+                            int32_t widthPt, int32_t heightPt,
+                            int32_t widthPx, int32_t heightPx,
+                            float dpr);
+    int setScanoutResource(uint32_t scanoutId, uint32_t resourceId,
+                           uint32_t width, uint32_t height);
+    int presentFlushedResource(uint32_t resourceId,
+                               uint32_t x, uint32_t y,
+                               uint32_t width, uint32_t height);
+
 #ifdef GFXSTREAM_BUILD_WITH_SNAPSHOT_FRONTEND_SUPPORT
     int snapshot(const char* directory);
     int restore(const char* directory);
@@ -161,6 +195,11 @@ class VirtioGpuFrontend {
     // LINT.ThenChange(VirtioGpuFrontend.h:virtio_gpu_frontend)
 
     std::unique_ptr<CleanupThread> mCleanupThread;
+
+    std::mutex mDisplayStateLock;
+    std::unordered_map<uint32_t, ScanoutBinding> mScanoutBindings;
+    std::unordered_map<uint32_t, NativeSurface> mNativeSurfaces;
+    bool mNativeWindowEnabled = false;
 };
 
 }  // namespace host

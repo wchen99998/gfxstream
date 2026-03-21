@@ -65,6 +65,14 @@
   }
 @end
 
+void dispatch_main_safe(dispatch_block_t block) {
+    if ([NSThread isMainThread]) {
+        block();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), block);
+    }
+}
+
 EGLNativeWindowType createSubWindow(FBNativeWindowType p_window,
                                     int x,
                                     int y,
@@ -79,11 +87,6 @@ EGLNativeWindowType createSubWindow(FBNativeWindowType p_window,
         return NULL;
     }
 
-    /* (x,y) assume an upper-left origin, but Cocoa uses a lower-left origin */
-    NSRect content_rect = [win contentRectForFrameRect:[win frame]];
-    int cocoa_y = (int)content_rect.size.height - (y + height);
-    NSRect contentRect = NSMakeRect(x, cocoa_y, width, height);
-
     // Enable views with metal backing when hardware acceleration is enabled, as it should provide
     // better performance and can be necessary for vulkan swapchain creation.
     bool useMetalView = true;
@@ -93,33 +96,44 @@ EGLNativeWindowType createSubWindow(FBNativeWindowType p_window,
         useMetalView = false;
     }
 
-    NSView* glView = NULL;
-    if (useMetalView) {
-        glView = [[EmuGLViewWithMetal alloc] initWithFrame:contentRect];
-    } else {
-        glView = [[EmuGLView alloc] initWithFrame:contentRect];
-    }
-    if (!glView) {
-        return NULL;
-    }
-    [glView setWantsBestResolutionOpenGLSurface:YES];
-    [glView setWantsLayer:YES];
-    [[win contentView] addSubview:glView];
-    [win makeKeyAndOrderFront:nil];
-    if (hideWindow) {
-        [glView setHidden:YES];
-    }
-    // We cannot use the dpr from [NSScreen mainScreen], which usually
-    // gives the wrong screen at this point.
-    [glView.layer setContentsScale:dpr];
-    return (EGLNativeWindowType)(glView);
+    __block EGLNativeWindowType subwin = NULL;
+    dispatch_main_safe(^{
+        /* (x,y) assume an upper-left origin, but Cocoa uses a lower-left origin */
+        NSRect content_rect = [win contentRectForFrameRect:[win frame]];
+        int cocoa_y = (int)content_rect.size.height - (y + height);
+        NSRect contentRect = NSMakeRect(x, cocoa_y, width, height);
+
+        NSView* glView = NULL;
+        if (useMetalView) {
+            glView = [[EmuGLViewWithMetal alloc] initWithFrame:contentRect];
+        } else {
+            glView = [[EmuGLView alloc] initWithFrame:contentRect];
+        }
+        if (!glView) {
+            return;
+        }
+        [glView setWantsBestResolutionOpenGLSurface:YES];
+        [glView setWantsLayer:YES];
+        [[win contentView] addSubview:glView];
+        [win makeKeyAndOrderFront:nil];
+        if (hideWindow) {
+            [glView setHidden:YES];
+        }
+        // We cannot use the dpr from [NSScreen mainScreen], which usually
+        // gives the wrong screen at this point.
+        [glView.layer setContentsScale:dpr];
+        subwin = (EGLNativeWindowType)(glView);
+    });
+    return subwin;
 }
 
 void destroySubWindow(EGLNativeWindowType win) {
     if(win){
-        NSView *glView = (NSView *)win;
-        [glView removeFromSuperview];
-        [glView release];
+        dispatch_main_safe(^{
+            NSView *glView = (NSView *)win;
+            [glView removeFromSuperview];
+            [glView release];
+        });
     }
 }
 
@@ -140,19 +154,22 @@ int moveSubWindow(FBNativeWindowType p_parent_window,
         return 0;
     }
 
-    /* The view must be removed from the hierarchy to be properly resized */
-    [glView removeFromSuperview];
+    __block int result = 0;
+    dispatch_main_safe(^{
+        /* The view must be removed from the hierarchy to be properly resized */
+        [glView removeFromSuperview];
 
-    /* (x,y) assume an upper-left origin, but Cocoa uses a lower-left origin */
-    NSRect content_rect = [win contentRectForFrameRect:[win frame]];
-    int cocoa_y = (int)content_rect.size.height - (y + height);
-    NSRect newFrame = NSMakeRect(x, cocoa_y, width, height);
-    [glView setFrame:newFrame];
+        /* (x,y) assume an upper-left origin, but Cocoa uses a lower-left origin */
+        NSRect content_rect = [win contentRectForFrameRect:[win frame]];
+        int cocoa_y = (int)content_rect.size.height - (y + height);
+        NSRect newFrame = NSMakeRect(x, cocoa_y, width, height);
+        [glView setFrame:newFrame];
 
-    /* Re-add the sub-window to the view hierarchy */
-    [[win contentView] addSubview:glView];
-
-    return 1;
+        /* Re-add the sub-window to the view hierarchy */
+        [[win contentView] addSubview:glView];
+        result = 1;
+    });
+    return result;
 }
 
 void* getNativeDisplay() {

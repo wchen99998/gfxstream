@@ -1723,6 +1723,15 @@ bool FrameBuffer::Impl::setupSubWindow(FBNativeWindowType p_window, int wx, int 
 
     bool success = false;
 
+    // Delete-only path: if we just removed the subwindow and the caller
+    // does not want a new one, treat it as a successful remove operation.
+    if (!m_subWin && deleteExisting && hideWindow) {
+        postWorkerContinueSignal.reset();
+        m_windowContentFullWidth = 0;
+        m_windowContentFullHeight = 0;
+        return true;
+    }
+
     // If the subwindow doesn't exist, create it with the appropriate dimensions
     if (!m_subWin) {
         // Create native subwindow for FB display output
