@@ -107,6 +107,8 @@ VG_EXPORT int gfxstream_backend_present_flushed_resource(
     uint32_t resource_id, uint32_t x, uint32_t y,
     uint32_t width, uint32_t height);
 
+VG_EXPORT void gfxstream_backend_set_vsync_hz(int vsync_hz);
+
 VG_EXPORT void stream_renderer_flush(uint32_t res_handle);
 
 VG_EXPORT void* stream_renderer_platform_create_shared_egl_context(void);
