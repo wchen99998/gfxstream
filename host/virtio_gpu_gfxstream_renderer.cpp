@@ -878,6 +878,14 @@ VG_EXPORT int gfxstream_backend_present_flushed_resource(
     return sFrontend()->presentFlushedResource(resource_id, x, y, width, height);
 }
 
+VG_EXPORT void gfxstream_backend_set_vsync_hz(int vsync_hz) {
+    auto* fb = gfxstream::FrameBuffer::getFB();
+    if (fb && vsync_hz > 0) {
+        GFXSTREAM_INFO("Setting gfxstream vsync to %d Hz", vsync_hz);
+        fb->setVsyncHz(vsync_hz);
+    }
+}
+
 VG_EXPORT void stream_renderer_teardown() {
     GFXSTREAM_INFO("Gfxstream shutting down.");
     sFrontend()->teardown();

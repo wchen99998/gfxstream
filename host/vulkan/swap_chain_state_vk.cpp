@@ -275,8 +275,13 @@ std::optional<SwapchainCreateInfoWrapper> SwapChainStateVk::createSwapChainCi(
     VK_CHECK(vk.vkGetPhysicalDeviceSurfacePresentModesKHR(physicalDevice, surface,
                                                           &presentModeCount, presentModes_.data()));
     std::unordered_set<VkPresentModeKHR> presentModes(presentModes_.begin(), presentModes_.end());
+    // Prefer MAILBOX for lowest-latency, non-blocking presentation. The guest
+    // already does its own vsync/frame-pacing, so FIFO's host-vsync blocking
+    // only adds backpressure that causes buffer stuffing in SurfaceFlinger.
     VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
-    if (!presentModes.count(VK_PRESENT_MODE_FIFO_KHR)) {
+    if (presentModes.count(VK_PRESENT_MODE_MAILBOX_KHR)) {
+        presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+    } else if (!presentModes.count(VK_PRESENT_MODE_FIFO_KHR)) {
         GFXSTREAM_ERROR("Failed to create swapchain: FIFO present mode not supported.");
         return std::nullopt;
     }
