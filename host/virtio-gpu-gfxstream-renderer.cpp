@@ -61,7 +61,12 @@ ParseGfxstreamFeatures(const int rendererFlags,
         gfxstream::base::setEnvironmentVariable("ANDROID_EGL_ON_EGL", "1");
         gfxstream::base::setEnvironmentVariable("ANDROID_EMUGL_VERBOSE", "1");
     }
-    gfxstream::base::setEnvironmentVariable("ANDROID_EMU_HEADLESS", "1");
+    const bool useNativeWindow =
+        rendererFlags & STREAM_RENDERER_FLAGS_VULKAN_NATIVE_SWAPCHAIN_BIT;
+
+    if (!useNativeWindow) {
+        gfxstream::base::setEnvironmentVariable("ANDROID_EMU_HEADLESS", "1");
+    }
 
     gfxstream::host::FeatureSet features;
     GFXSTREAM_SET_FEATURE_ON_CONDITION(
@@ -899,6 +904,10 @@ VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer
 
     sFrontend()->init(renderer, renderer_cookie, features, fence_callback);
 
+    const bool useNativeWindow =
+        renderer_flags & STREAM_RENDERER_FLAGS_VULKAN_NATIVE_SWAPCHAIN_BIT;
+    sFrontend()->setNativeWindowEnabled(useNativeWindow);
+
     GFXSTREAM_INFO("Gfxstream initialized successfully!");
     return 0;
 }
@@ -909,6 +918,42 @@ VG_EXPORT void gfxstream_backend_setup_window(void* native_window_handle, int32_
                                               int32_t fb_height) {
     sFrontend()->setupWindow(native_window_handle, window_x, window_y, window_width,
                                window_height, fb_width, fb_height);
+}
+
+VG_EXPORT int gfxstream_backend_setup_native_surface(
+        uint32_t display_id, void* native_window_handle,
+        int32_t width_pt, int32_t height_pt,
+        int32_t width_px, int32_t height_px,
+        float dpr) {
+    return sFrontend()->setupNativeSurface(display_id, native_window_handle,
+                                           width_pt, height_pt,
+                                           width_px, height_px, dpr);
+}
+
+VG_EXPORT int gfxstream_backend_teardown_native_surface(uint32_t display_id) {
+    return sFrontend()->teardownNativeSurface(display_id);
+}
+
+VG_EXPORT int gfxstream_backend_resize_native_surface(
+        uint32_t display_id,
+        int32_t width_pt, int32_t height_pt,
+        int32_t width_px, int32_t height_px,
+        float dpr) {
+    return sFrontend()->resizeNativeSurface(display_id,
+                                            width_pt, height_pt,
+                                            width_px, height_px, dpr);
+}
+
+VG_EXPORT int gfxstream_backend_set_scanout_resource(
+        uint32_t scanout_id, uint32_t resource_id,
+        uint32_t width, uint32_t height) {
+    return sFrontend()->setScanoutResource(scanout_id, resource_id, width, height);
+}
+
+VG_EXPORT int gfxstream_backend_present_flushed_resource(
+        uint32_t resource_id, uint32_t x, uint32_t y,
+        uint32_t width, uint32_t height) {
+    return sFrontend()->presentFlushedResource(resource_id, x, y, width, height);
 }
 
 VG_EXPORT void stream_renderer_teardown() {

@@ -24,6 +24,11 @@
 #include "GlesCompat.h"
 #endif
 
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>
+void dispatch_main_safe(dispatch_block_t block);
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif

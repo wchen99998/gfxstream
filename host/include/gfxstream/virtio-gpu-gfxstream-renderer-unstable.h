@@ -84,6 +84,29 @@ VG_EXPORT void gfxstream_backend_setup_window(void* native_window_handle, int32_
                                               int32_t window_height, int32_t fb_width,
                                               int32_t fb_height);
 
+VG_EXPORT int gfxstream_backend_setup_native_surface(
+    uint32_t display_id, void* native_window_handle,
+    int32_t width_pt, int32_t height_pt,
+    int32_t width_px, int32_t height_px,
+    float dpr);
+
+VG_EXPORT int gfxstream_backend_teardown_native_surface(uint32_t display_id);
+
+VG_EXPORT int gfxstream_backend_resize_native_surface(
+    uint32_t display_id,
+    int32_t width_pt, int32_t height_pt,
+    int32_t width_px, int32_t height_px,
+    float dpr);
+
+VG_EXPORT int gfxstream_backend_set_scanout_resource(
+    uint32_t scanout_id, uint32_t resource_id,
+    uint32_t width, uint32_t height);
+
+/* Returns 1 if presented (native mode), 0 if legacy fallback is needed. */
+VG_EXPORT int gfxstream_backend_present_flushed_resource(
+    uint32_t resource_id, uint32_t x, uint32_t y,
+    uint32_t width, uint32_t height);
+
 VG_EXPORT void stream_renderer_flush(uint32_t res_handle);
 
 VG_EXPORT void* stream_renderer_platform_create_shared_egl_context(void);

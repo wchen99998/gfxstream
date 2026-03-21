@@ -473,6 +473,18 @@ int VirtioGpuFrontend::importResource(uint32_t res_handle,
 void VirtioGpuFrontend::unrefResource(uint32_t resourceId) {
     GFXSTREAM_DEBUG("resource: %u", resourceId);
 
+    // Clear any scanout bindings that reference this resource.
+    {
+        std::lock_guard<std::mutex> lock(mDisplayStateLock);
+        for (auto it = mScanoutBindings.begin(); it != mScanoutBindings.end(); ) {
+            if (it->second.resource_id == resourceId) {
+                it = mScanoutBindings.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
     auto resourceIt = mResources.find(resourceId);
     if (resourceIt == mResources.end()) return;
     auto& resource = resourceIt->second;
@@ -1230,6 +1242,200 @@ int VirtioGpuFrontend::restore(const char* directory) {
 }
 
 #endif  // ifdef GFXSTREAM_BUILD_WITH_SNAPSHOT_FRONTEND_SUPPORT
+
+void VirtioGpuFrontend::setNativeWindowEnabled(bool enabled) {
+    mNativeWindowEnabled = enabled;
+}
+
+int VirtioGpuFrontend::setScanoutResource(uint32_t scanoutId, uint32_t resourceId,
+                                          uint32_t width, uint32_t height) {
+    std::lock_guard<std::mutex> lock(mDisplayStateLock);
+
+    if (resourceId == 0) {
+        mScanoutBindings.erase(scanoutId);
+        return 0;
+    }
+
+    if (mResources.find(resourceId) == mResources.end()) {
+        GFXSTREAM_ERROR("setScanoutResource: resource %u not found", resourceId);
+        return -EINVAL;
+    }
+
+    mScanoutBindings[scanoutId] = {
+        .resource_id = resourceId,
+        .width = width,
+        .height = height,
+    };
+    return 0;
+}
+
+int VirtioGpuFrontend::setupNativeSurface(uint32_t displayId, void* nativeWindowHandle,
+                                          int32_t widthPt, int32_t heightPt,
+                                          int32_t widthPx, int32_t heightPx,
+                                          float dpr) {
+    if (!mNativeWindowEnabled) {
+        GFXSTREAM_ERROR("setupNativeSurface: native-window mode not enabled");
+        return -ENOTSUP;
+    }
+    if (!mRenderer) {
+        GFXSTREAM_ERROR("setupNativeSurface: renderer not available");
+        return -EINVAL;
+    }
+    if (!nativeWindowHandle) {
+        GFXSTREAM_ERROR("setupNativeSurface: null native window handle");
+        return -EINVAL;
+    }
+
+    bool success = mRenderer->showOpenGLSubwindow(
+        (FBNativeWindowType)(uintptr_t)nativeWindowHandle,
+        0, 0,
+        widthPt, heightPt,
+        widthPx, heightPx,
+        dpr, 0,
+        /*deleteExisting=*/false,
+        /*hideWindow=*/false);
+
+    if (!success) {
+        GFXSTREAM_ERROR("setupNativeSurface: showOpenGLSubwindow failed");
+        return -EIO;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mDisplayStateLock);
+        auto& surface = mNativeSurfaces[displayId];
+        surface.nativeWindowHandle = nativeWindowHandle;
+        surface.widthPt = widthPt;
+        surface.heightPt = heightPt;
+        surface.widthPx = widthPx;
+        surface.heightPx = heightPx;
+        surface.dpr = dpr;
+        surface.active = true;
+    }
+
+    GFXSTREAM_DEBUG("setupNativeSurface: display %u active", displayId);
+    return 0;
+}
+
+int VirtioGpuFrontend::resizeNativeSurface(uint32_t displayId,
+                                           int32_t widthPt, int32_t heightPt,
+                                           int32_t widthPx, int32_t heightPx,
+                                           float dpr) {
+    void* nativeWindowHandle = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mDisplayStateLock);
+        auto it = mNativeSurfaces.find(displayId);
+        if (it == mNativeSurfaces.end() || !it->second.active) {
+            GFXSTREAM_ERROR("resizeNativeSurface: display %u not active", displayId);
+            return -EINVAL;
+        }
+        nativeWindowHandle = it->second.nativeWindowHandle;
+    }
+
+    bool success = mRenderer->showOpenGLSubwindow(
+        (FBNativeWindowType)(uintptr_t)nativeWindowHandle,
+        0, 0,
+        widthPt, heightPt,
+        widthPx, heightPx,
+        dpr, 0,
+        /*deleteExisting=*/true,
+        /*hideWindow=*/false);
+
+    if (!success) {
+        GFXSTREAM_ERROR("resizeNativeSurface: showOpenGLSubwindow failed");
+        return -EIO;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mDisplayStateLock);
+        auto& surface = mNativeSurfaces[displayId];
+        surface.widthPt = widthPt;
+        surface.heightPt = heightPt;
+        surface.widthPx = widthPx;
+        surface.heightPx = heightPx;
+        surface.dpr = dpr;
+    }
+    return 0;
+}
+
+int VirtioGpuFrontend::teardownNativeSurface(uint32_t displayId) {
+    void* nativeWindowHandle = nullptr;
+    int32_t widthPt = 0, heightPt = 0, widthPx = 0, heightPx = 0;
+    float dpr = 1.0f;
+
+    {
+        std::lock_guard<std::mutex> lock(mDisplayStateLock);
+        auto it = mNativeSurfaces.find(displayId);
+        if (it == mNativeSurfaces.end() || !it->second.active) {
+            return 0;  // already inactive
+        }
+        nativeWindowHandle = it->second.nativeWindowHandle;
+        widthPt = it->second.widthPt;
+        heightPt = it->second.heightPt;
+        widthPx = it->second.widthPx;
+        heightPx = it->second.heightPx;
+        dpr = it->second.dpr;
+    }
+
+    if (mRenderer) {
+        mRenderer->showOpenGLSubwindow(
+            (FBNativeWindowType)(uintptr_t)nativeWindowHandle,
+            0, 0,
+            widthPt, heightPt,
+            widthPx, heightPx,
+            dpr, 0,
+            /*deleteExisting=*/true,
+            /*hideWindow=*/true);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mDisplayStateLock);
+        mNativeSurfaces.erase(displayId);
+    }
+
+    GFXSTREAM_DEBUG("teardownNativeSurface: display %u removed", displayId);
+    return 0;
+}
+
+int VirtioGpuFrontend::presentFlushedResource(uint32_t resourceId,
+                                              uint32_t x, uint32_t y,
+                                              uint32_t width, uint32_t height) {
+    uint32_t scanoutId = UINT32_MAX;
+
+    {
+        std::lock_guard<std::mutex> lock(mDisplayStateLock);
+
+        for (const auto& [sid, binding] : mScanoutBindings) {
+            if (binding.resource_id == resourceId) {
+                scanoutId = sid;
+                break;
+            }
+        }
+
+        if (scanoutId == UINT32_MAX) {
+            GFXSTREAM_DEBUG("presentFlushedResource: resource %u not bound", resourceId);
+            return 0;
+        }
+
+        auto surfaceIt = mNativeSurfaces.find(scanoutId);
+        if (surfaceIt == mNativeSurfaces.end() || !surfaceIt->second.active) {
+            GFXSTREAM_DEBUG("presentFlushedResource: scanout %u not in native mode", scanoutId);
+            return 0;
+        }
+    }
+
+    // Use a global timeline task so QEMU can treat the async native present
+    // like flush completion even though no explicit guest fence is created here.
+    auto taskId = mVirtioGpuTimelines->enqueueTask(VirtioGpuRingGlobal{});
+    gfxstream::FrameBuffer::getFB()->postWithCallback(
+        resourceId,
+        [this, taskId](std::shared_future<void> waitForGpu) {
+            waitForGpu.wait();
+            mVirtioGpuTimelines->notifyTaskCompletion(taskId);
+        },
+        /*needLockAndBind=*/true);
+
+    return 1;
+}
 
 }  // namespace host
 }  // namespace gfxstream
