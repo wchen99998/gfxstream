@@ -57,6 +57,7 @@ struct Post {
     std::unique_ptr<CompletionCallback> completionCallback = nullptr;
     std::unique_ptr<Block> block = nullptr;
     HandleType cbHandle = 0;
+    std::shared_ptr<ColorBuffer> retainedColorBuffer;
     std::optional<std::array<float, 16>> colorTransform;
 
     //TODO: remove union here and separate into message structures

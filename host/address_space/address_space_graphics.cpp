@@ -537,6 +537,7 @@ private:
         }
 
         delete block.subAlloc;
+        block.subAlloc = nullptr;
 
         block.isEmpty = true;
     }

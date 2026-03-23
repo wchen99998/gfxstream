@@ -37,6 +37,7 @@
 #include "gfxstream/synchronization/Lock.h"
 #include "gfxstream/system/System.h"
 #include "render-utils/Renderer.h"
+#include "borrowed_image_vk.h"
 #include "vk_decoder_global_state.h"
 #include "vk_emulated_physical_device_memory.h"
 #include "vk_format_utils.h"
@@ -3130,17 +3131,6 @@ bool VkEmulation::readColorBufferToBytesLocked(uint32_t colorBufferHandle, uint3
         return false;
     }
 
-    // Avoid transitioning from VK_IMAGE_LAYOUT_UNDEFINED. Unfortunetly, Android does not
-    // yet have a mechanism for sharing the expected VkImageLayout. However, the Vulkan
-    // spec's image layout transition sections says "If the old layout is
-    // VK_IMAGE_LAYOUT_UNDEFINED, the contents of that range may be discarded." Some
-    // Vulkan drivers have been observed to actually perform the discard which leads to
-    // ColorBuffer-s being unintentionally cleared. See go/ahb-vkimagelayout for a more
-    // thorough write up.
-    if (colorBufferInfo->currentLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
-        colorBufferInfo->currentLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    }
-
     // Record our synchronization commands.
     const VkCommandBufferBeginInfo beginInfo = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -3154,63 +3144,57 @@ bool VkEmulation::readColorBufferToBytesLocked(uint32_t colorBufferHandle, uint3
 
     const VkImageLayout currentLayout = colorBufferInfo->currentLayout;
     const VkImageLayout transferSrcLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    const VkImageLayout postReadbackLayout =
+        currentLayout != VK_IMAGE_LAYOUT_UNDEFINED ? currentLayout : transferSrcLayout;
 
-    const VkImageMemoryBarrier toTransferSrcImageBarrier = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .pNext = nullptr,
-        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-        .oldLayout = currentLayout,
-        .newLayout = transferSrcLayout,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = colorBufferInfo->image,
-        .subresourceRange =
-            {
-                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .baseMipLevel = 0,
-                .levelCount = 1,
-                .baseArrayLayer = 0,
-                .layerCount = 1,
-            },
-    };
+    BorrowedImageInfoVk borrowedImageInfo = {};
+    borrowedImageInfo.image = colorBufferInfo->image;
+    borrowedImageInfo.preBorrowLayout = currentLayout;
+    borrowedImageInfo.preBorrowQueueFamilyIndex = colorBufferInfo->currentQueueFamilyIndex;
+    borrowedImageInfo.postBorrowLayout = postReadbackLayout;
+    borrowedImageInfo.postBorrowQueueFamilyIndex = colorBufferInfo->currentQueueFamilyIndex;
+    std::vector<VkImageMemoryBarrier> preUseQueueTransferBarriers;
+    std::vector<VkImageMemoryBarrier> preUseLayoutTransitionBarriers;
+    std::vector<VkImageMemoryBarrier> postUseLayoutTransitionBarriers;
+    std::vector<VkImageMemoryBarrier> postUseQueueTransferBarriers;
+    addNeededBarriersToUseBorrowedImage(borrowedImageInfo, mQueueFamilyIndex, transferSrcLayout,
+                                        transferSrcLayout, VK_ACCESS_TRANSFER_READ_BIT,
+                                        &preUseQueueTransferBarriers,
+                                        &preUseLayoutTransitionBarriers,
+                                        &postUseLayoutTransitionBarriers,
+                                        &postUseQueueTransferBarriers);
 
-    vk->vkCmdPipelineBarrier(mCommandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                             &toTransferSrcImageBarrier);
+    if (!preUseQueueTransferBarriers.empty()) {
+        vk->vkCmdPipelineBarrier(mCommandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
+                                 static_cast<uint32_t>(preUseQueueTransferBarriers.size()),
+                                 preUseQueueTransferBarriers.data());
+    }
+    if (!preUseLayoutTransitionBarriers.empty()) {
+        vk->vkCmdPipelineBarrier(mCommandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                                 static_cast<uint32_t>(preUseLayoutTransitionBarriers.size()),
+                                 preUseLayoutTransitionBarriers.data());
+    }
 
     vk->vkCmdCopyImageToBuffer(mCommandBuffer, colorBufferInfo->image,
                                transferSrcLayout, mStaging.mBuffer,
                                bufferImageCopies.size(), bufferImageCopies.data());
 
-    // Change back to original layout
-    if (currentLayout != VK_IMAGE_LAYOUT_UNDEFINED) {
-        // Transfer back to original layout.
-        const VkImageMemoryBarrier toCurrentLayoutImageBarrier = {
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-            .dstAccessMask = VK_ACCESS_NONE_KHR,
-            .oldLayout = transferSrcLayout,
-            .newLayout = colorBufferInfo->currentLayout,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = colorBufferInfo->image,
-            .subresourceRange =
-                {
-                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .baseMipLevel = 0,
-                    .levelCount = 1,
-                    .baseArrayLayer = 0,
-                    .layerCount = 1,
-                },
-        };
+    if (!postUseLayoutTransitionBarriers.empty()) {
         vk->vkCmdPipelineBarrier(mCommandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                                 &toCurrentLayoutImageBarrier);
-    } else {
-        colorBufferInfo->currentLayout = transferSrcLayout;
+                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
+                                 static_cast<uint32_t>(postUseLayoutTransitionBarriers.size()),
+                                 postUseLayoutTransitionBarriers.data());
     }
+    if (!postUseQueueTransferBarriers.empty()) {
+        vk->vkCmdPipelineBarrier(mCommandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
+                                 static_cast<uint32_t>(postUseQueueTransferBarriers.size()),
+                                 postUseQueueTransferBarriers.data());
+    }
+
+    colorBufferInfo->currentLayout = postReadbackLayout;
 
     mDebugUtilsHelper.cmdEndDebugLabel(mCommandBuffer);
 
@@ -3850,61 +3834,58 @@ bool VkEmulation::updateColorBufferFromBytesLocked(uint32_t colorBufferHandle, u
     if (isSnapshotLoad) {
         currentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     }
-    const VkImageMemoryBarrier toTransferDstImageBarrier = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .pNext = nullptr,
-        .srcAccessMask = 0,
-        .dstAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
-        .oldLayout = currentLayout,
-        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = colorBufferInfo->image,
-        .subresourceRange =
-            {
-                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .baseMipLevel = 0,
-                .levelCount = 1,
-                .baseArrayLayer = 0,
-                .layerCount = 1,
-            },
-    };
+    const VkImageLayout transferDstLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    const VkImageLayout postUpdateLayout =
+        currentLayout != VK_IMAGE_LAYOUT_UNDEFINED ? currentLayout : transferDstLayout;
+    BorrowedImageInfoVk borrowedImageInfo = {};
+    borrowedImageInfo.image = colorBufferInfo->image;
+    borrowedImageInfo.preBorrowLayout = currentLayout;
+    borrowedImageInfo.preBorrowQueueFamilyIndex = colorBufferInfo->currentQueueFamilyIndex;
+    borrowedImageInfo.postBorrowLayout = postUpdateLayout;
+    borrowedImageInfo.postBorrowQueueFamilyIndex = colorBufferInfo->currentQueueFamilyIndex;
+    std::vector<VkImageMemoryBarrier> preUseQueueTransferBarriers;
+    std::vector<VkImageMemoryBarrier> preUseLayoutTransitionBarriers;
+    std::vector<VkImageMemoryBarrier> postUseLayoutTransitionBarriers;
+    std::vector<VkImageMemoryBarrier> postUseQueueTransferBarriers;
+    addNeededBarriersToUseBorrowedImage(borrowedImageInfo, mQueueFamilyIndex, transferDstLayout,
+                                        transferDstLayout, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                        &preUseQueueTransferBarriers,
+                                        &preUseLayoutTransitionBarriers,
+                                        &postUseLayoutTransitionBarriers,
+                                        &postUseQueueTransferBarriers);
 
-    vk->vkCmdPipelineBarrier(mCommandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                             &toTransferDstImageBarrier);
+    if (!preUseQueueTransferBarriers.empty()) {
+        vk->vkCmdPipelineBarrier(mCommandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
+                                 static_cast<uint32_t>(preUseQueueTransferBarriers.size()),
+                                 preUseQueueTransferBarriers.data());
+    }
+    if (!preUseLayoutTransitionBarriers.empty()) {
+        vk->vkCmdPipelineBarrier(mCommandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                                 static_cast<uint32_t>(preUseLayoutTransitionBarriers.size()),
+                                 preUseLayoutTransitionBarriers.data());
+    }
 
     // Copy from staging buffer to color buffer image
     vk->vkCmdCopyBufferToImage(mCommandBuffer, mStaging.mBuffer, colorBufferInfo->image,
-                               toTransferDstImageBarrier.newLayout, bufferImageCopies.size(),
+                               transferDstLayout, bufferImageCopies.size(),
                                bufferImageCopies.data());
 
-    if (colorBufferInfo->currentLayout != VK_IMAGE_LAYOUT_UNDEFINED) {
-        const VkImageMemoryBarrier toCurrentLayoutImageBarrier = {
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = toTransferDstImageBarrier.dstAccessMask,
-            .dstAccessMask = VK_ACCESS_NONE_KHR,
-            .oldLayout = toTransferDstImageBarrier.newLayout,
-            .newLayout = colorBufferInfo->currentLayout,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = colorBufferInfo->image,
-            .subresourceRange =
-                {
-                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .baseMipLevel = 0,
-                    .levelCount = 1,
-                    .baseArrayLayer = 0,
-                    .layerCount = 1,
-                },
-        };
+    if (!postUseLayoutTransitionBarriers.empty()) {
         vk->vkCmdPipelineBarrier(mCommandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                                 &toCurrentLayoutImageBarrier);
-    } else {
-        colorBufferInfo->currentLayout = toTransferDstImageBarrier.newLayout;
+                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
+                                 static_cast<uint32_t>(postUseLayoutTransitionBarriers.size()),
+                                 postUseLayoutTransitionBarriers.data());
     }
+    if (!postUseQueueTransferBarriers.empty()) {
+        vk->vkCmdPipelineBarrier(mCommandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
+                                 static_cast<uint32_t>(postUseQueueTransferBarriers.size()),
+                                 postUseQueueTransferBarriers.data());
+    }
+
+    colorBufferInfo->currentLayout = postUpdateLayout;
 
     mDebugUtilsHelper.cmdEndDebugLabel(mCommandBuffer);
 

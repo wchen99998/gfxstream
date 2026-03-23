@@ -419,20 +419,25 @@ uint64_t AddressSpaceSharedSlotsHostMemoryAllocatorContext::allocate(AddressSpac
 }
 
 uint64_t AddressSpaceSharedSlotsHostMemoryAllocatorContext::unallocate(uint64_t physAddr) {
+    // physAddr here is the offset from the BAR base as returned to the guest by
+    // populatePhysAddr().  mAllocations is keyed by actual GPA, so convert back.
+    const uint64_t actualGPA = physAddr + mHw->getPhysAddrStartLocked();
+
     std::lock_guard<std::mutex> lock(gBlocksMutex);
 
-    const auto it = mAllocations.find(physAddr);
+    const auto it = mAllocations.find(actualGPA);
     if (it == mAllocations.end()) {
         if (IsAsgTraceEnabled()) {
-            GFXSTREAM_ERROR("ASG shared-slots unallocate missing phys=0x%llx",
-                            static_cast<unsigned long long>(physAddr));
+            GFXSTREAM_ERROR("ASG shared-slots unallocate missing phys=0x%llx (actualGPA=0x%llx)",
+                            static_cast<unsigned long long>(physAddr),
+                            static_cast<unsigned long long>(actualGPA));
         }
         return ~0ULL;
     }
 
     const uint32_t allocationSize = it->second.first;
     MemBlock* block = it->second.second;
-    block->unallocate(physAddr, allocationSize);
+    block->unallocate(actualGPA, allocationSize);
     mAllocations.erase(it);
 
     if (block->isAllFree()) {

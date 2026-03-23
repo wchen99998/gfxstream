@@ -17,6 +17,8 @@
 #include <algorithm>
 #include <limits>
 
+#include "gfxstream/common/logging.h"
+
 namespace gfxstream {
 namespace host {
 namespace vk {
@@ -35,11 +37,20 @@ EmulatedPhysicalDeviceQueueProperties::EmulatedPhysicalDeviceQueueProperties(
         // supports multiple graphics queues to reduce divergence.
         for (VkQueueFamilyProperties& qfp : mQueueFamilyProperties) {
             if (qfp.queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+                GFXSTREAM_INFO("VulkanVirtualQueue: overriding graphics queueCount %u -> 2",
+                               qfp.queueCount);
                 qfp.queueCount = 2;
             }
 
             // TODO(b/329845987) Protected memory is not supported yet on emulators.
             qfp.queueFlags &= ~VK_QUEUE_PROTECTED_BIT;
+        }
+    } else {
+        for (const VkQueueFamilyProperties& qfp : mQueueFamilyProperties) {
+            if (qfp.queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+                GFXSTREAM_INFO("VulkanVirtualQueue disabled: graphics queueCount = %u",
+                               qfp.queueCount);
+            }
         }
     }
 }

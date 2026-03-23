@@ -14,11 +14,15 @@
 #include "vk_decoder_global_state.h"
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
+#include <exception>
 #include <functional>
+#include <future>
 #include <list>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -6586,6 +6590,7 @@ class VkDecoderGlobalState::Impl {
             anbInfo->on_vkAcquireImageANDROID(m_vkEmulation, vk, device, defaultQueue, defaultQueueFamilyIndex,
                                               defaultQueueMutex, semaphore, usedFence);
         if (result != VK_SUCCESS) {
+            builder.MarkSubmissionFailed();
             return result;
         }
 
@@ -7250,7 +7255,7 @@ class VkDecoderGlobalState::Impl {
         std::mutex* queueMutex = nullptr;
         PhysicalQueuePendingOps* pendingOps = nullptr;
         bool sharedQueue = false;
-        DeviceOpTracker* deviceOpTracker = nullptr;
+        DeviceOpTrackerPtr deviceOpTracker;
 
         {
             std::lock_guard<std::mutex> lock(mMutex);
@@ -7308,7 +7313,7 @@ class VkDecoderGlobalState::Impl {
                 return VK_ERROR_INITIALIZATION_FAILED;
             }
 
-            deviceOpTracker = deviceInfo->deviceOpTracker.get();
+            deviceOpTracker = deviceInfo->deviceOpTracker;
         }
 
         for (HandleType cb : acquiredColorBuffers) {
@@ -7347,12 +7352,35 @@ class VkDecoderGlobalState::Impl {
         }
 
         VkFence usedFence = fence;
+        bool destroyUsedFenceAfterSync = false;
         DeviceOpBuilder builder(*deviceOpTracker);
+        const auto failQueueSubmit = [&](VkResult result) {
+            if (destroyUsedFenceAfterSync && usedFence != VK_NULL_HANDLE) {
+                vk->vkDestroyFence(device, usedFence, nullptr);
+            }
+            builder.MarkSubmissionFailed();
+            return result;
+        };
         if (VK_NULL_HANDLE == usedFence) {
-            // Note: This fence will be managed by the DeviceOpTracker after the
-            // OnQueueSubmittedWithFence call, so it does not need to be destroyed in the scope
-            // of this queueSubmit
-            usedFence = builder.CreateFenceForOp();
+            if (!releasedColorBuffers.empty()) {
+                const VkFenceCreateInfo fenceCreateInfo = {
+                    .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+                    .pNext = nullptr,
+                    .flags = 0,
+                };
+                VkResult result = vk->vkCreateFence(device, &fenceCreateInfo, nullptr, &usedFence);
+                if (result != VK_SUCCESS) {
+                    GFXSTREAM_WARNING("vkCreateFence failed: %s [%d]", string_VkResult(result),
+                                      result);
+                    return failQueueSubmit(result);
+                }
+                destroyUsedFenceAfterSync = true;
+            } else {
+                // Note: This fence will be managed by the DeviceOpTracker after the
+                // OnQueueSubmittedWithFence call, so it does not need to be destroyed in the
+                // scope of this queueSubmit.
+                usedFence = builder.CreateFenceForOp();
+            }
         }
 
         // Dispatch only if it's safe
@@ -7365,7 +7393,7 @@ class VkDecoderGlobalState::Impl {
                 if (result != VK_SUCCESS) {
                     GFXSTREAM_WARNING("dispatchVkQueueSubmit failed: %s [%d]", string_VkResult(result),
                                     result);
-                    return result;
+                    return failQueueSubmit(result);
                 }
             } else {
                 // Special handling of submissions where the signalling will be done later.
@@ -7402,12 +7430,55 @@ class VkDecoderGlobalState::Impl {
                 if (result != VK_SUCCESS) {
                     GFXSTREAM_WARNING("dispatchVkQueueSubmit failed: %s [%d]", string_VkResult(result),
                                     result);
-                    return result;
+                    return failQueueSubmit(result);
                 }
             }
         }
 
         DeviceOpWaitable queueCompletedWaitable = builder.OnQueueSubmittedWithFence(usedFence);
+        if (destroyUsedFenceAfterSync) {
+            deviceOpTracker->AddPendingGarbage(queueCompletedWaitable, usedFence);
+        }
+
+        if (!releasedColorBuffers.empty()) {
+            const auto backendCallbacks = m_vkEmulation->getCallbacks();
+            if (!backendCallbacks.scheduleAsyncWork ||
+                !backendCallbacks.setColorBufferPendingVulkanCompletion) {
+                GFXSTREAM_FATAL("Missing backend callbacks for released color buffer sync.");
+            }
+
+            auto completionSucceeded = std::make_shared<std::atomic<bool>>(false);
+            auto completionFuture = backendCallbacks.scheduleAsyncWork(
+                [deviceOpTracker, queueCompletedWaitable, completionSucceeded]() mutable {
+                    while (!IsDone(queueCompletedWaitable)) {
+                        deviceOpTracker->PollAndProcessGarbage();
+                        std::this_thread::yield();
+                    }
+
+                    DeviceOpStatus completionStatus = DeviceOpStatus::kFailure;
+                    try {
+                        completionStatus = GetStatus(queueCompletedWaitable);
+                    } catch (const std::exception& err) {
+                        GFXSTREAM_ERROR(
+                            "Released color buffer sync lost queue completion state: %s",
+                            err.what());
+                    }
+                    if (completionStatus != DeviceOpStatus::kDone) {
+                        GFXSTREAM_ERROR(
+                            "Skipping released color buffer sync after queue completion failure: "
+                            "trackerStatus=%d",
+                            static_cast<int>(completionStatus));
+                    } else {
+                        completionSucceeded->store(true, std::memory_order_release);
+                    }
+                },
+                "wait for released color buffers after queue submit");
+
+            for (HandleType cb : releasedColorBuffers) {
+                backendCallbacks.setColorBufferPendingVulkanCompletion(
+                    cb, completionFuture, completionSucceeded);
+            }
+        }
 
         {
             std::lock_guard<std::mutex> lock(mMutex);
@@ -7465,30 +7536,6 @@ class VkDecoderGlobalState::Impl {
                 fenceInfo->latestUse = queueCompletedWaitable;
             }
         }
-
-        if (!releasedColorBuffers.empty()) {
-            // Presentation images are not expected to use timeline semaphores. In case of this
-            // warning when the virtual queue is active, special handling will be required to
-            // finish the after-dispatch operations. vkWaitForFences is skipped, as it can deadlock.
-            if (canDispatch) {
-                VkResult result =
-                    vk->vkWaitForFences(device, 1, &usedFence, VK_TRUE, /* 5 sec */ 5000000000L);
-                if (result != VK_SUCCESS) {
-                    // This may cause presentation issues, but no need to return a failure
-                    GFXSTREAM_ERROR("Cannot sync colorbuffers, vkWaitForFences failed: %s [%d]",
-                                    string_VkResult(result), result);
-                } else {
-                    for (HandleType cb : releasedColorBuffers) {
-                        m_vkEmulation->getCallbacks().flushColorBuffer(cb);
-                    }
-                }
-            } else {
-                GFXSTREAM_ERROR(
-                    "Waiting timeline semaphores on presentation images is not supported when "
-                    "the virtual queue is active.");
-            }
-        }
-
         // Unsafe to release when snapshot enabled.
         // Snapshot load might fail to find the shader modules if we release them here.
         if (!snapshotsEnabled()) {

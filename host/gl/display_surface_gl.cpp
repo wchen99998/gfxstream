@@ -83,7 +83,7 @@ class DisplaySurfaceGlContextHelper : public ContextHelper {
                 // Legacy swiftshader logspam on exit with this line.
                 GFXSTREAM_DEBUG("Failed to make display surface context current: %d",
                                 s_egl.eglGetError());
-                // Fall through to allow adding previous context to stack.
+                return false;
             }
         }
 
