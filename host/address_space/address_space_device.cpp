@@ -103,7 +103,7 @@ class AddressSpaceDeviceState {
         auto& contextDesc = mContexts[handle];
 
         contextDesc.pingInfo = reinterpret_cast<AddressSpaceDevicePingInfo*>(
-            gfxstream::get_gfxstream_vm_operations().lookup_user_memory(gpa));
+            get_gfxstream_vm_operations().lookup_user_memory(gpa));
         contextDesc.pingInfoGpa = gpa;
 
         if (IsAsgTraceEnabled()) {
@@ -399,7 +399,7 @@ class AddressSpaceDeviceState {
                                static_cast<unsigned long long>(gpa), ptr,
                                static_cast<unsigned long long>(size));
             }
-            gfxstream::get_gfxstream_vm_operations().map_user_memory(gpa, ptr, size);
+            get_gfxstream_vm_operations().map_user_memory(gpa, ptr, size);
             return true;
         } else {
             GFXSTREAM_ERROR("Failed: hva %p -> gpa [0x%llx 0x%llx]",
@@ -415,7 +415,7 @@ class AddressSpaceDeviceState {
                                static_cast<unsigned long long>(gpa),
                                static_cast<unsigned long long>(size));
             }
-            gfxstream::get_gfxstream_vm_operations().unmap_user_memory(gpa, size);
+            get_gfxstream_vm_operations().unmap_user_memory(gpa, size);
             return true;
         } else {
             GFXSTREAM_FATAL("Failed: gpa [0x%llx 0x%llx]",
@@ -450,7 +450,7 @@ class AddressSpaceDeviceState {
             GFXSTREAM_INFO("ASG getHostPtr vm-lookup gpa=0x%llx",
                            static_cast<unsigned long long>(gpa));
         }
-        return gfxstream::get_gfxstream_vm_operations().lookup_user_memory(gpa);
+        return get_gfxstream_vm_operations().lookup_user_memory(gpa);
     }
 
 

@@ -2263,34 +2263,6 @@ class VkDecoderGlobalState::Impl {
         deviceInfo.externalFenceInfo.supportedBinarySemaphoreHandleTypes =
             static_cast<VkExternalSemaphoreHandleTypeFlagBits>(supportedBinarySemaphoreHandleTypes);
 
-#ifdef _WIN32
-        // Use vkGetMemoryWin32HandleKHR
-        deviceInfo.getMemoryHandleFunc = reinterpret_cast<PFN_vkGetMemoryWin32HandleKHR>(
-            vk->vkGetDeviceProcAddr(*pDevice, "vkGetMemoryWin32HandleKHR"));
-        if (!deviceInfo.getMemoryHandleFunc) {
-            mDeviceInfo.erase(*pDevice);
-            return VK_ERROR_INITIALIZATION_FAILED;
-        }
-#elif defined(__APPLE__)
-        // Mirror VkCommonOperations.cpp:1566 — Metal uses its own export path
-        if (m_vkEmulation->supportsExternalMemoryMetal()) {
-            deviceInfo.getMemoryHandleFunc = nullptr;
-        } else {
-            deviceInfo.getMemoryHandleFunc = reinterpret_cast<PFN_vkGetMemoryFdKHR>(
-                vk->vkGetDeviceProcAddr(*pDevice, "vkGetMemoryFdKHR"));
-            if (!deviceInfo.getMemoryHandleFunc) {
-                mDeviceInfo.erase(*pDevice);
-                return VK_ERROR_INITIALIZATION_FAILED;
-            }
-        }
-#elif defined(__linux__)
-        deviceInfo.getMemoryHandleFunc = reinterpret_cast<PFN_vkGetMemoryFdKHR>(
-            vk->vkGetDeviceProcAddr(*pDevice, "vkGetMemoryFdKHR"));
-        if (!deviceInfo.getMemoryHandleFunc) {
-            mDeviceInfo.erase(*pDevice);
-            return VK_ERROR_INITIALIZATION_FAILED;
-        }
-#endif
         GFXSTREAM_INFO(
             "Created VkDevice:%p for application:'%s' instance:%p. ASTC emulation:%s CPU decoding:%s.",
             *pDevice, instanceInfo.applicationName.c_str(), physicalDeviceInfo.instance,
@@ -6827,7 +6799,9 @@ class VkDecoderGlobalState::Impl {
             // descriptors. Map the VkDeviceMemory directly via vkMapMemory (backed by
             // MTLBuffer in shared storage mode) and provide the host pointer through
             // the mapping path so stream_renderer_resource_map() works.
-            needsHostMapping = needsHostMapping || m_vkEmulation->supportsExternalMemoryMetal();
+            needsHostMapping =
+                needsHostMapping ||
+                m_vkEmulation->getExternalMemoryMode() == ExternalMemory::Mode::Metal;
 #endif
 
             if (needsHostMapping && !info->ptr) {
@@ -6840,7 +6814,7 @@ class VkDecoderGlobalState::Impl {
             }
 
 #if defined(__APPLE__)
-            if (!m_vkEmulation->supportsExternalMemoryMetal()) {
+            if (m_vkEmulation->getExternalMemoryMode() != ExternalMemory::Mode::Metal) {
 #endif
                 auto exportedMemoryOpt = exportMemoryHandle(deviceInfo, vk, device, memory);
                 if (!exportedMemoryOpt) {

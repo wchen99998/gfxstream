@@ -9,7 +9,7 @@ package(
 cc_library(
     name = "gfxstream_backend_headers",
     hdrs = [
-        "backend/include/gfxstream/host/vm_operations.h",
+        "common/include/gfxstream/host/vm_operations.h",
         "include/gfxstream/virtio-gpu-gfxstream-renderer.h",
         "include/gfxstream/virtio-gpu-gfxstream-renderer-unstable.h",
         "include/render-utils/MediaNative.h",

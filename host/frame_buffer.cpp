@@ -1725,9 +1725,6 @@ bool FrameBuffer::Impl::setupSubWindow(FBNativeWindowType p_window, int wx, int 
         // Replacing the native surface still needs a hard drain, but in-place
         // resizes keep the existing surface and let DisplayVk hand off to a
         // new swapchain on the next post.
-        auto watchdog = WATCHDOG_BUILDER(m_healthMonitor.get(), "Draining the VkQueue")
-                            .setTimeoutMs(6000)
-                            .build();
         m_displayVk->drainQueues();
     }
 

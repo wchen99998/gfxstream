@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 inc_host_address_space = include_directories('include')
-inc_host_backend_public = include_directories('../backend/include')
+inc_host_common_public = include_directories('../common/include')
 
 files_lib_host_address_space = files(
   'address_space_device.cpp',
@@ -18,7 +18,7 @@ lib_host_address_space = static_library(
   files_lib_host_address_space,
   include_directories: [
     inc_host_address_space,
-    inc_host_backend_public,
+    inc_host_common_public,
     inc_common_base,
     inc_gfxstream_server,
     inc_common_logging,

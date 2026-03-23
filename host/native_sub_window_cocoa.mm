@@ -200,7 +200,7 @@ void* getNativeDisplay() {
 
 // Retrieve metal layer from the view, to create a swapchain surface
 // To be used with VK_EXT_metal_surface
-void* getMetalLayerFromView(void* view) {
+extern "C" void* getMetalLayerFromView(void* view) {
     EmuGLViewWithMetal* metalView = (EmuGLViewWithMetal*)view;
     if (!metalView) {
         return nil;

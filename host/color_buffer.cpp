@@ -571,8 +571,8 @@ bool ColorBuffer::Impl::ensureVkBacking(vk::VkEmulation& vkEmulation) {
     const uint32_t mipLevels = 1;
 
     mColorBufferVk = vk::ColorBufferVk::create(vkEmulation, mHandle, mWidth, mHeight, mFormat,
-                                                mFrameworkFormat, vulkanOnly, memoryProperty,
-                                                /*stream=*/nullptr, mipLevels);
+                                               vulkanOnly, memoryProperty, /*stream=*/nullptr,
+                                               mipLevels);
     if (!mColorBufferVk) {
         GFXSTREAM_ERROR("ensureVkBacking: Failed to lazily create ColorBufferVk for handle:%d",
                         mHandle);

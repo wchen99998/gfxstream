@@ -140,7 +140,7 @@ std::unique_ptr<AndroidNativeBufferInfo> AndroidNativeBufferInfo::create(
             "ColorBuffer:%d share info missing; attempting lazy Vulkan backing repair.",
             out->mColorBufferHandle);
 
-        auto* fb = gfxstream::FrameBuffer::getFB();
+        auto* fb = FrameBuffer::getFB();
         if (fb) {
             auto cb = fb->findColorBuffer(out->mColorBufferHandle);
             if (cb) {

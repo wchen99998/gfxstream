@@ -1514,7 +1514,7 @@ int VirtioGpuFrontend::presentFlushedResource(uint32_t resourceId,
     // Use a global timeline task so QEMU can treat the async native present
     // like flush completion even though no explicit guest fence is created here.
     auto taskId = mVirtioGpuTimelines->enqueueTask(VirtioGpuRingGlobal{});
-    gfxstream::FrameBuffer::getFB()->postWithCallback(
+    FrameBuffer::getFB()->postWithCallback(
         resourceId,
         [this, taskId](std::shared_future<void> waitForGpu) {
             waitForGpu.wait();

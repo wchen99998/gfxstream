@@ -21,7 +21,7 @@
 #include <algorithm>
 #include <string>
 
-#include "GLESVersionDetector.h"
+#include "gles_version_detector.h"
 #include "OpenGLESDispatch/DispatchTables.h"
 #include "gfxstream/common/logging.h"
 
@@ -249,15 +249,7 @@ TextureDraw::TextureDraw()
       mIndexBuffer(0),
       mVertexArray(0),
       mColorTransform(-1),
-      mUseCoreProfile(shouldEnableCoreProfile()),
-      mMaskTexture(0),
-      mMaskWidth(0),
-      mMaskHeight(0),
-      mMaskTextureWidth(0),
-      mMaskTextureHeight(0),
-      mHaveNewMask(false),
-      mMaskIsValid(false),
-      mShouldReallocateTexture(true) {
+      mUseCoreProfile(shouldEnableCoreProfile()) {
     // Create shaders and program.
     mVertexShader = createShader(GL_VERTEX_SHADER, getVertexShaderSource(mUseCoreProfile));
     mFragmentShader = createShader(GL_FRAGMENT_SHADER, getFragmentShaderSource(mUseCoreProfile));
@@ -550,9 +542,6 @@ TextureDraw::~TextureDraw() {
     }
     mMaskLayer.destroy();
     mBackgroundLayer.destroy();
-    if (mMaskTexture) {
-        s_gles2.glDeleteTextures(1, &mMaskTexture);
-    }
     if (mProgram) {
         s_gles2.glDeleteProgram(mProgram);
     }

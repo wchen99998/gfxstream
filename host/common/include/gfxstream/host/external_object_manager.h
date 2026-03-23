@@ -106,6 +106,18 @@ struct GenericDescriptorInfo {
     uint32_t streamHandleType;
 };
 
+#if defined(__ANDROID__)
+typedef ExternalHandleInfo BlobDescriptorType;
+#else
+typedef GenericDescriptorInfo BlobDescriptorType;
+#endif
+
+#if defined(__ANDROID__)
+typedef ExternalHandleType BlobDescriptorValueType;
+#else
+typedef ManagedDescriptor BlobDescriptorValueType;
+#endif
+
 struct BlobDescriptorInfo {
     BlobDescriptorType descriptorInfo;
     uint32_t caching;

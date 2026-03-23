@@ -22,7 +22,7 @@
 #include <string>
 #include <unordered_map>
 
-#include "FrameBuffer.h"
+#include "frame_buffer.h"
 #include "gfxstream/common/logging.h"
 #include "render-utils/RenderChannel.h"
 #include "render-utils/Renderer.h"

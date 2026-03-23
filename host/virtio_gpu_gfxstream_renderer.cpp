@@ -25,7 +25,6 @@ extern "C" {
 
 #include "frame_buffer.h"
 #include "goldfish_pipe/GoldfishPipeService.h"
-#include "gfxstream/Metrics.h"
 #include "gfxstream/strings.h"
 #include "gfxstream/common/logging.h"
 #include "gfxstream/host/address_space_device.h"
@@ -60,6 +59,10 @@ static VirtioGpuFrontend* sFrontend() {
     static VirtioGpuFrontend* p = new VirtioGpuFrontend;
     return p;
 }
+
+[[maybe_unused]] stream_renderer_param_metrics_callback_set_annotation
+    sMetricsSetAnnotation = nullptr;
+[[maybe_unused]] stream_renderer_param_metrics_callback_abort sMetricsAbort = nullptr;
 
 static int DisplayDpiFromMillimeters(uint32_t pixels, uint32_t millimeters) {
     if (!pixels || !millimeters) {
@@ -635,7 +638,7 @@ VG_EXPORT int stream_renderer_resume() {
 }
 
 VG_EXPORT const void* stream_renderer_get_address_space_device_control_ops() {
-    return &gfxstream::get_gfxstream_address_space_ops();
+    return &gfxstream::host::get_gfxstream_address_space_ops();
 }
 
 VG_EXPORT const void* stream_renderer_set_address_space_hw_funcs(const void* hw_funcs) {
@@ -690,14 +693,6 @@ VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer
         {STREAM_RENDERER_PARAM_WIN0_HEIGHT, "WIN0_HEIGHT"},
         {STREAM_RENDERER_PARAM_DEBUG_CALLBACK, "DEBUG_CALLBACK"},
         {STREAM_RENDERER_SKIP_OPENGLES_INIT, "SKIP_OPENGLES_INIT"},
-        {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT,
-         "METRICS_CALLBACK_ADD_INSTANT_EVENT"},
-        {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_DESCRIPTOR,
-         "METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_DESCRIPTOR"},
-        {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_METRIC,
-         "METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_METRIC"},
-        {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_VULKAN_OUT_OF_MEMORY_EVENT,
-         "METRICS_CALLBACK_ADD_VULKAN_OUT_OF_MEMORY_EVENT"},
         {STREAM_RENDERER_PARAM_GFXSTREAM_VM_OPS, "GFXSTREAM_VM_OPS"},
         {STREAM_RENDERER_PARAM_ADDRESS_SPACE_HW_FUNCS, "ADDRESS_SPACE_HW_FUNCS"},
         {STREAM_RENDERER_PARAM_DISPLAY_WIDTH_MM, "DISPLAY_WIDTH_MM"},
@@ -816,16 +811,14 @@ VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer
                 break;
             }
             case STREAM_RENDERER_PARAM_METRICS_CALLBACK_SET_ANNOTATION: {
-                MetricsLogger::set_crash_annotation_callback =
+                sMetricsSetAnnotation =
                     reinterpret_cast<stream_renderer_param_metrics_callback_set_annotation>(
                         static_cast<uintptr_t>(param.value));
                 break;
             }
             case STREAM_RENDERER_PARAM_METRICS_CALLBACK_ABORT: {
-                GFXSTREAM_FATAL(
-                    "Deprecated STREAM_RENDERER_PARAM_METRICS_CALLBACK_ABORT. "
-                    "Use STREAM_RENDERER_PARAM_DEBUG_CALLBACK instead which includes "
-                    "fatal logs.");
+                sMetricsAbort = reinterpret_cast<stream_renderer_param_metrics_callback_abort>(
+                    static_cast<uintptr_t>(param.value));
                 break;
             }
             default: {
@@ -892,14 +885,14 @@ VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer
         return -EINVAL;
     }
 
-    const gfxstream_vm_ops previousVmOps = gfxstream::get_gfxstream_vm_operations();
+    const gfxstream_vm_ops previousVmOps = gfxstream::host::get_gfxstream_vm_operations();
     const AddressSpaceHwFuncs* previousAddressSpaceHwFuncs =
         gfxstream::host::gfxstream_address_space_get_hw_funcs();
     const bool vmOpsInstalled = vmOps != nullptr;
     const bool addressSpaceHwFuncsInstalled = addressSpaceHwFuncs != nullptr;
     const auto restoreGlobalHooks = [&]() {
         if (vmOpsInstalled) {
-            gfxstream::set_gfxstream_vm_operations(previousVmOps);
+            gfxstream::host::set_gfxstream_vm_operations(previousVmOps);
         }
         if (addressSpaceHwFuncsInstalled) {
             gfxstream::host::gfxstream_address_space_set_hw_funcs(previousAddressSpaceHwFuncs);
@@ -907,7 +900,7 @@ VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer
     };
 
     if (vmOpsInstalled) {
-        gfxstream::set_gfxstream_vm_operations(*vmOps);
+        gfxstream::host::set_gfxstream_vm_operations(*vmOps);
         GFXSTREAM_INFO("Configured gfxstream VM ops lookup_user_memory=%p",
                        reinterpret_cast<const void*>(vmOps->lookup_user_memory));
     }
@@ -1035,7 +1028,7 @@ VG_EXPORT int gfxstream_backend_present_flushed_resource(
 }
 
 VG_EXPORT void gfxstream_backend_set_vsync_hz(int vsync_hz) {
-    auto* fb = gfxstream::FrameBuffer::getFB();
+    auto* fb = FrameBuffer::getFB();
     if (fb && vsync_hz > 0) {
         GFXSTREAM_INFO("Setting gfxstream vsync to %d Hz", vsync_hz);
         fb->setVsyncHz(vsync_hz);
