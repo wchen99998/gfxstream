@@ -57,11 +57,8 @@ class DisplayVkTest : public ::testing::Test {
             .queueFamilyIndex = m_compositorQueueFamilyIndex};
         ASSERT_EQ(k_vk->vkCreateCommandPool(m_vkDevice, &commandPoolCi, nullptr, &m_vkCommandPool),
                   VK_SUCCESS);
-        m_displayVk = std::make_unique<DisplayVk>(
-            *k_vk, m_vkPhysicalDevice, m_vkDevice, nullptr, m_compositorQueueFamilyIndex,
-            m_compositorVkQueue, m_compositorVkQueueLock,
-            m_swapChainQueueFamilyIndex, m_swapChainVkQueue,
-            m_swapChainVkQueueLock);
+        m_YcbcrSamplerPool.init(k_vk, k_vk, m_vkPhysicalDevice, m_vkDevice);
+        createDisplay(nullptr);
         m_displaySurface = std::make_unique<DisplaySurface>(
             k_width, k_height,
             DisplaySurfaceVk::create(*k_vk, m_vkInstance, m_window->getNativeWindow()));
@@ -75,6 +72,8 @@ class DisplayVkTest : public ::testing::Test {
             ASSERT_EQ(k_vk->vkQueueWaitIdle(m_swapChainVkQueue), VK_SUCCESS);
 
             m_displayVk.reset();
+            m_compositorVk.reset();
+            m_YcbcrSamplerPool.destroy();
             k_vk->vkDestroyCommandPool(m_vkDevice, m_vkCommandPool, nullptr);
             k_vk->vkDestroyDevice(m_vkDevice, nullptr);
             k_vk->vkDestroySurfaceKHR(m_vkInstance, m_vkSurface, nullptr);
@@ -115,8 +114,25 @@ class DisplayVkTest : public ::testing::Test {
     VkQueue m_swapChainVkQueue = VK_NULL_HANDLE;
     std::shared_ptr<gfxstream::base::Lock> m_swapChainVkQueueLock;
     VkCommandPool m_vkCommandPool = VK_NULL_HANDLE;
+    vk_util::YcbcrSamplerPool m_YcbcrSamplerPool;
+    ImageSupport m_imageSupport = ImageSupport::GetDefaultUnpopulatedImageSupport();
+    std::unique_ptr<CompositorVk> m_compositorVk = nullptr;
     std::unique_ptr<DisplayVk> m_displayVk = nullptr;
     std::unique_ptr<DisplaySurface> m_displaySurface = nullptr;
+
+    std::unique_ptr<CompositorVk> createCompositor() {
+        return CompositorVk::create(*k_vk, m_vkDevice, m_vkPhysicalDevice, m_compositorVkQueue,
+                                    m_compositorVkQueueLock, m_compositorQueueFamilyIndex,
+                                    /*maxFramesInFlight=*/3, &m_YcbcrSamplerPool, m_imageSupport,
+                                    DebugUtilsHelper::withUtilsDisabled());
+    }
+
+    void createDisplay(CompositorVk* compositorVk) {
+        m_displayVk = std::make_unique<DisplayVk>(
+            *k_vk, m_vkPhysicalDevice, m_vkDevice, compositorVk, m_compositorQueueFamilyIndex,
+            m_compositorVkQueue, m_compositorVkQueueLock, m_swapChainQueueFamilyIndex,
+            m_swapChainVkQueue, m_swapChainVkQueueLock);
+    }
 
    private:
     void createInstance() {
@@ -356,6 +372,46 @@ TEST_F(DisplayVkTest, PostWithColorTransform) {
     }
     for (auto &waitForGpuFuture : waitForGpuFutures) {
         waitForGpuFuture.wait();
+    }
+}
+
+TEST_F(DisplayVkTest, ResizeReclaimsImmediateModeResources) {
+    m_displayVk.reset();
+    m_compositorVk = createCompositor();
+    ASSERT_NE(m_compositorVk, nullptr);
+    createDisplay(m_compositorVk.get());
+    m_displayVk->bindToSurface(m_displaySurface.get());
+
+    constexpr uint32_t textureWidth = 20;
+    constexpr uint32_t textureHeight = 40;
+    auto texture = RenderTexture::create(*k_vk, m_vkDevice, m_vkPhysicalDevice, m_compositorVkQueue,
+                                         m_vkCommandPool, textureWidth, textureHeight);
+    ASSERT_NE(texture, nullptr);
+    std::vector<uint32_t> pixels(textureWidth * textureHeight, 0xff00ffff);
+    ASSERT_TRUE(texture->write(pixels));
+
+    for (uint32_t i = 0; i < 3; ++i) {
+        const auto imageInfo = createBorrowedImageInfo(texture);
+        auto postResult = m_displayVk->post(imageInfo.get(), 90.0f, std::nullopt);
+        ASSERT_TRUE(postResult.success);
+    }
+
+    m_displaySurface->updateSize(k_width - 32, k_height - 16);
+
+    const auto resizedImageInfo = createBorrowedImageInfo(texture);
+    auto resizedPostResult = m_displayVk->post(resizedImageInfo.get(), 90.0f, std::nullopt);
+    ASSERT_TRUE(resizedPostResult.success);
+    resizedPostResult.postCompletedWaitable.wait();
+
+    std::array<CompositorVkBase::ImmediateModeResources*, 3> resources = {};
+    for (auto& resource : resources) {
+        resource = m_compositorVk->acquireImmediateModeResources();
+        ASSERT_NE(resource, nullptr);
+    }
+    ASSERT_EQ(m_compositorVk->acquireImmediateModeResources(), nullptr);
+
+    for (auto* resource : resources) {
+        m_compositorVk->releaseImmediateModeResources(resource);
     }
 }
 

@@ -1410,12 +1410,14 @@ CompositorVk::CompositionFinishedWaitable CompositorVk::compose(
     addNeededBarriersToUseBorrowedImage(
         *compositionVk.targetImage, m_queueFamilyIndex, kTargetImageInitialLayoutUsed,
         kTargetImageFinalLayoutUsed, VK_ACCESS_MEMORY_WRITE_BIT,
+        BorrowedImageLayoutSemantics::kMayDiscardContents,
         &preCompositionQueueTransferBarriers, &preCompositionLayoutTransitionBarriers,
         &postCompositionLayoutTransitionBarriers, &postCompositionQueueTransferBarriers);
     for (const BorrowedImageInfoVk* sourceImage : compositionVk.layersSourceImages) {
         addNeededBarriersToUseBorrowedImage(
             *sourceImage, m_queueFamilyIndex, kSourceImageInitialLayoutUsed,
             kSourceImageFinalLayoutUsed, VK_ACCESS_SHADER_READ_BIT,
+            BorrowedImageLayoutSemantics::kPreserveContents,
             &preCompositionQueueTransferBarriers, &preCompositionLayoutTransitionBarriers,
             &postCompositionLayoutTransitionBarriers, &postCompositionQueueTransferBarriers);
     }

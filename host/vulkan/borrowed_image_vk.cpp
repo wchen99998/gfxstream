@@ -17,22 +17,41 @@
 namespace gfxstream {
 namespace host {
 namespace vk {
+namespace {
+
+VkImageLayout getEffectivePreBorrowLayout(
+    const BorrowedImageInfoVk& borrowedImageInfo, VkImageLayout usedInitialImageLayout,
+    BorrowedImageLayoutSemantics layoutSemantics) {
+    if (layoutSemantics == BorrowedImageLayoutSemantics::kPreserveContents &&
+        borrowedImageInfo.preBorrowLayout == VK_IMAGE_LAYOUT_UNDEFINED &&
+        usedInitialImageLayout != VK_IMAGE_LAYOUT_UNDEFINED) {
+        return usedInitialImageLayout;
+    }
+
+    return borrowedImageInfo.preBorrowLayout;
+}
+
+}  // namespace
 
 void addNeededBarriersToUseBorrowedImage(
     const BorrowedImageInfoVk& borrowedImageInfo, uint32_t usedQueueFamilyIndex,
     VkImageLayout usedInitialImageLayout, VkImageLayout usedFinalImageLayout,
-    VkAccessFlags usedAccessMask, std::vector<VkImageMemoryBarrier>* preUseQueueTransferBarriers,
+    VkAccessFlags usedAccessMask, BorrowedImageLayoutSemantics layoutSemantics,
+    std::vector<VkImageMemoryBarrier>* preUseQueueTransferBarriers,
     std::vector<VkImageMemoryBarrier>* preUseLayoutTransitionBarriers,
     std::vector<VkImageMemoryBarrier>* postUseLayoutTransitionBarriers,
     std::vector<VkImageMemoryBarrier>* postUseQueueTransferBarriers) {
+    const VkImageLayout effectivePreBorrowLayout = getEffectivePreBorrowLayout(
+        borrowedImageInfo, usedInitialImageLayout, layoutSemantics);
+
     if (borrowedImageInfo.preBorrowQueueFamilyIndex != usedQueueFamilyIndex) {
         const VkImageMemoryBarrier queueTransferBarrier = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .pNext = nullptr,
             .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-            .oldLayout = borrowedImageInfo.preBorrowLayout,
-            .newLayout = borrowedImageInfo.preBorrowLayout,
+            .oldLayout = effectivePreBorrowLayout,
+            .newLayout = effectivePreBorrowLayout,
             .srcQueueFamilyIndex = borrowedImageInfo.preBorrowQueueFamilyIndex,
             .dstQueueFamilyIndex = usedQueueFamilyIndex,
             .image = borrowedImageInfo.image,
@@ -47,14 +66,14 @@ void addNeededBarriersToUseBorrowedImage(
         };
         preUseQueueTransferBarriers->emplace_back(queueTransferBarrier);
     }
-    if (borrowedImageInfo.preBorrowLayout != usedInitialImageLayout &&
+    if (effectivePreBorrowLayout != usedInitialImageLayout &&
         usedInitialImageLayout != VK_IMAGE_LAYOUT_UNDEFINED) {
         const VkImageMemoryBarrier layoutTransitionBarrier = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .pNext = nullptr,
             .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
             .dstAccessMask = usedAccessMask,
-            .oldLayout = borrowedImageInfo.preBorrowLayout,
+            .oldLayout = effectivePreBorrowLayout,
             .newLayout = usedInitialImageLayout,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,

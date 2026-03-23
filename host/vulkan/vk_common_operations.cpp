@@ -1661,8 +1661,8 @@ void VkEmulation::initFeatures(Features features) {
 VkEmulation::~VkEmulation() {
     std::lock_guard<std::mutex> lock(mMutex);
 
-    mCompositorVk.reset();
     mDisplayVk.reset();
+    mCompositorVk.reset();
     mUdmabufCreator.reset();
 
     mYcbcrSamplerPool.destroy();
@@ -3159,6 +3159,7 @@ bool VkEmulation::readColorBufferToBytesLocked(uint32_t colorBufferHandle, uint3
     std::vector<VkImageMemoryBarrier> postUseQueueTransferBarriers;
     addNeededBarriersToUseBorrowedImage(borrowedImageInfo, mQueueFamilyIndex, transferSrcLayout,
                                         transferSrcLayout, VK_ACCESS_TRANSFER_READ_BIT,
+                                        BorrowedImageLayoutSemantics::kPreserveContents,
                                         &preUseQueueTransferBarriers,
                                         &preUseLayoutTransitionBarriers,
                                         &postUseLayoutTransitionBarriers,
@@ -3849,6 +3850,7 @@ bool VkEmulation::updateColorBufferFromBytesLocked(uint32_t colorBufferHandle, u
     std::vector<VkImageMemoryBarrier> postUseQueueTransferBarriers;
     addNeededBarriersToUseBorrowedImage(borrowedImageInfo, mQueueFamilyIndex, transferDstLayout,
                                         transferDstLayout, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                        BorrowedImageLayoutSemantics::kMayDiscardContents,
                                         &preUseQueueTransferBarriers,
                                         &preUseLayoutTransitionBarriers,
                                         &postUseLayoutTransitionBarriers,

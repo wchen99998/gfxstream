@@ -155,6 +155,7 @@ std::unique_ptr<DisplaySurfaceGl> DisplaySurfaceGl::createPbufferSurface(
     EGLSurface surface = s_egl.eglCreatePbufferSurface(display, config, surfaceAttribs);
     if (surface == EGL_NO_SURFACE) {
         GFXSTREAM_ERROR("Failed to create pbuffer surface for DisplaySurfaceGl.");
+        s_egl.eglDestroyContext(display, context);
         return nullptr;
     }
 
@@ -177,6 +178,7 @@ std::unique_ptr<DisplaySurfaceGl> DisplaySurfaceGl::createWindowSurface(
     EGLSurface surface = s_egl.eglCreateWindowSurface(display, config, window, nullptr);
     if (surface == EGL_NO_SURFACE) {
         GFXSTREAM_ERROR("Failed to create window surface for DisplaySurfaceGl.");
+        s_egl.eglDestroyContext(display, context);
         return nullptr;
     }
 

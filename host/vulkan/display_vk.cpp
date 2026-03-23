@@ -162,10 +162,40 @@ void DisplayVk::surfaceUpdated(DisplaySurface* surface) {
 
 void DisplayVk::unbindFromSurfaceImpl() { destroySwapchain(); }
 
+bool DisplayVk::reclaimPendingPost(std::optional<PendingPost>& pendingPost,
+                                   bool waitForCompletion) {
+    if (!pendingPost.has_value()) {
+        return false;
+    }
+
+    if (!pendingPost->m_postResourceFuture.valid()) {
+        GFXSTREAM_FATAL("Invalid pending post future.");
+    }
+
+    if (!waitForCompletion) {
+        VkResult fenceStatus = m_vk.vkGetFenceStatus(m_vkDevice, pendingPost->m_completeFence);
+        if (fenceStatus == VK_NOT_READY) {
+            return false;
+        }
+        VK_CHECK(fenceStatus);
+    }
+
+    m_freePostResources.emplace_back(pendingPost->m_postResourceFuture.get());
+    pendingPost = std::nullopt;
+    return true;
+}
+
+void DisplayVk::reclaimPendingPosts(bool waitForCompletion) {
+    for (auto& pendingPost : m_pendingPosts) {
+        reclaimPendingPost(pendingPost, waitForCompletion);
+    }
+}
+
 void DisplayVk::destroySwapchain() {
     drainQueues();
+    reclaimPendingPosts(/*waitForCompletion=*/true);
     m_freePostResources.clear();
-    m_postResourceFutures.clear();
+    m_pendingPosts.clear();
     m_swapChainStateVk.reset();
     m_needToRecreateSwapChain = true;
 }
@@ -204,7 +234,7 @@ bool DisplayVk::recreateSwapchain() {
     if (m_swapChainStateVk == nullptr) return false;
 
     const int numSwapChainImages = m_swapChainStateVk->getVkImages().size();
-    m_postResourceFutures.resize(numSwapChainImages, std::nullopt);
+    m_pendingPosts.resize(numSwapChainImages, std::nullopt);
     for (int i = 0; i < numSwapChainImages + 1; ++i) {
         m_freePostResources.emplace_back(PostResource::create(m_vk, m_vkDevice, m_vkCommandPool));
     }
@@ -302,7 +332,8 @@ DisplayVk::PostResult DisplayVk::postImpl(
                 image, usedQueueFamilyIndex,
                 /*usedInitialImageLayout=*/VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 /*usedFinalImageLayout=*/VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                VK_ACCESS_TRANSFER_READ_BIT, &acquireQueueTransferBarriers,
+                VK_ACCESS_TRANSFER_READ_BIT, BorrowedImageLayoutSemantics::kPreserveContents,
+                &acquireQueueTransferBarriers,
                 &acquireLayoutTransitionBarriers, &releaseLayoutTransitionBarriers,
                 &releaseQueueTransferBarriers);
 
@@ -410,28 +441,12 @@ DisplayVk::PostResult DisplayVk::postImpl(
         return PostResult{true, std::move(completedFuture)};
     }
 
-    for (auto& postResourceFutureOpt : m_postResourceFutures) {
-        if (!postResourceFutureOpt.has_value()) {
-            continue;
-        }
-        auto postResourceFuture = postResourceFutureOpt.value();
-        if (!postResourceFuture.valid()) {
-            GFXSTREAM_FATAL("Invalid postResourceFuture in m_postResourceFutures.");
-        }
-        std::future_status status = postResourceFuture.wait_for(std::chrono::seconds(0));
-        if (status == std::future_status::ready) {
-            m_freePostResources.emplace_back(postResourceFuture.get());
-            postResourceFutureOpt = std::nullopt;
-        }
+    reclaimPendingPosts(/*waitForCompletion=*/false);
+    if (m_freePostResources.empty()) {
+        reclaimPendingPosts(/*waitForCompletion=*/true);
     }
     if (m_freePostResources.empty()) {
-        for (auto& postResourceFutureOpt : m_postResourceFutures) {
-            if (!postResourceFutureOpt.has_value()) {
-                continue;
-            }
-            m_freePostResources.emplace_back(postResourceFutureOpt.value().get());
-            postResourceFutureOpt = std::nullopt;
-        }
+        GFXSTREAM_FATAL("DisplayVk failed to reclaim PostResource.");
     }
     std::shared_ptr<PostResource> postResource = m_freePostResources.front();
     m_freePostResources.pop_front();
@@ -447,9 +462,8 @@ DisplayVk::PostResult DisplayVk::postImpl(
     }
     VK_CHECK(acquireRes);
 
-    if (m_postResourceFutures[imageIndex].has_value()) {
-        m_freePostResources.emplace_back(m_postResourceFutures[imageIndex].value().get());
-        m_postResourceFutures[imageIndex] = std::nullopt;
+    if (m_pendingPosts[imageIndex].has_value()) {
+        reclaimPendingPost(m_pendingPosts[imageIndex], /*waitForCompletion=*/true);
     }
 
     VkCommandBuffer cmdBuff = postResource->m_vkCommandBuffer;
@@ -488,8 +502,14 @@ DisplayVk::PostResult DisplayVk::postImpl(
         presentRect.width != swapchainImageExtent.width ||
         presentRect.height != swapchainImageExtent.height;
 
+    const bool hasScreenBackground = m_compositorVk && m_compositorVk->hasScreenBackground();
+    const bool hasScreenMask = m_compositorVk && m_compositorVk->hasScreenMask();
+    const bool needsImmediateModeResources =
+        m_compositorVk &&
+        (hasScreenBackground || hasScreenMask || rotationDegrees != 0.0f ||
+         colorTransform.has_value());
     CompositorVkBase::ImmediateModeResources* imResources =
-        m_compositorVk ? m_compositorVk->acquireImmediateModeResources() : nullptr;
+        needsImmediateModeResources ? m_compositorVk->acquireImmediateModeResources() : nullptr;
 
     CompositorVk::ImageDrawParams drawParams = {
         .commandBuffer = cmdBuff,
@@ -504,7 +524,7 @@ DisplayVk::PostResult DisplayVk::postImpl(
         .colorTransform = std::nullopt,
     };
 
-    bool renderBackground = imResources && m_compositorVk->hasScreenBackground();
+    bool renderBackground = imResources && hasScreenBackground;
     if (renderBackground) {
         if (currentSwapchainLayout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
             VkImageMemoryBarrier transitionSwapchainToAttachmentBarrier = {
@@ -629,7 +649,7 @@ DisplayVk::PostResult DisplayVk::postImpl(
     }
 
     // Render screen mask overlay
-    if (imResources && m_compositorVk->hasScreenMask()) {
+    if (imResources && hasScreenMask) {
         if (useBlit) {
             VkImageMemoryBarrier transitionSwapchainToAttachmentBarrier = {
                 .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -714,7 +734,10 @@ DisplayVk::PostResult DisplayVk::postImpl(
             }
             return postResource;
         }).share();
-    m_postResourceFutures[imageIndex] = postResourceFuture;
+    m_pendingPosts[imageIndex] = PendingPost{
+        .m_completeFence = postCompleteFence,
+        .m_postResourceFuture = postResourceFuture,
+    };
 
     auto swapChain = m_swapChainStateVk->getSwapChain();
     VkPresentInfoKHR presentInfo = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,

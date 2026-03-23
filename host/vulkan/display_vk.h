@@ -62,8 +62,11 @@ class DisplayVk : public Display {
 
    private:
     class PostResource;
+    struct PendingPost;
     void destroySwapchain();
     bool recreateSwapchain();
+    bool reclaimPendingPost(std::optional<PendingPost>& pendingPost, bool waitForCompletion);
+    void reclaimPendingPosts(bool waitForCompletion);
 
     // The success component of the result is false when the swapchain is no longer valid and
     // bindToSurface() needs to be called again. When the success component is true, the waitable
@@ -109,9 +112,13 @@ class DisplayVk : public Display {
         const VkCommandPool m_vkCommandPool;
     };
 
+    struct PendingPost {
+        VkFence m_completeFence = VK_NULL_HANDLE;
+        std::shared_future<std::shared_ptr<PostResource>> m_postResourceFuture;
+    };
+
     std::deque<std::shared_ptr<PostResource>> m_freePostResources;
-    std::vector<std::optional<std::shared_future<std::shared_ptr<PostResource>>>>
-        m_postResourceFutures;
+    std::vector<std::optional<PendingPost>> m_pendingPosts;
     int m_inFlightFrameIndex;
 
     class ImageBorrowResource {
