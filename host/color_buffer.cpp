@@ -291,6 +291,9 @@ void ColorBuffer::Impl::readToBytes(
     touch();
 
     if (mColorBufferVk && shouldPreferVkReadback(pixelsFormat)) {
+        if (!resolvePendingVulkanCompletion()) {
+            GFXSTREAM_FATAL("Failed to sync ColorBuffer:%d for Vulkan readback.", mHandle);
+        }
         if (!invalidateForVk()) {
             GFXSTREAM_FATAL("Failed to sync ColorBuffer:%d for Vulkan readback.", mHandle);
         }
