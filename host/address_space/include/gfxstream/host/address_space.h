@@ -480,7 +480,7 @@ static void address_space_allocator_init(
 /* At this point there should be no used blocks and all available blocks must
  * have been merged into one block.
  */
-static void address_space_allocator_destroy(
+static inline void address_space_allocator_destroy(
     struct address_space_allocator *allocator)
 {
     address_space_assert(allocator->size == 1);
@@ -500,7 +500,7 @@ static void address_space_allocator_destroy_nocleanup(
 
 /* Resets the state of the allocator to the initial state without
  * performing any dynamic memory management. */
-static void address_space_allocator_reset(
+static inline void address_space_allocator_reset(
     struct address_space_allocator *allocator)
 {
     address_space_assert(allocator->size >= 1);
@@ -516,7 +516,7 @@ static void address_space_allocator_reset(
 typedef void (*address_block_iter_func_t)(void* context, struct address_block*);
 typedef void (*address_space_allocator_iter_func_t)(void* context, struct address_space_allocator*);
 
-static void address_space_allocator_run(
+static inline void address_space_allocator_run(
     struct address_space_allocator *allocator,
     void* context,
     address_space_allocator_iter_func_t allocator_func,
