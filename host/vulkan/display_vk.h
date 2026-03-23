@@ -61,6 +61,7 @@ class DisplayVk : public Display {
     void unbindFromSurfaceImpl() override;
 
    private:
+    class PostResource;
     void destroySwapchain();
     bool recreateSwapchain();
 

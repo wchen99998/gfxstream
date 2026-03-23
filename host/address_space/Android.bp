@@ -30,7 +30,9 @@ cc_library_static {
     ],
     srcs: [
         "address_space_device.cpp",
+        "address_space_host_memory_allocator.cpp",
         "address_space_graphics.cpp",
+        "address_space_shared_slots_host_memory_allocator.cpp",
         "ring_buffer.cpp",
         "sub_allocator.cpp",
     ],

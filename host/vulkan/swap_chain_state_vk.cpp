@@ -229,7 +229,8 @@ bool SwapChainStateVk::validateQueueFamilyProperties(const VulkanDispatch& vk,
 
 std::optional<SwapchainCreateInfoWrapper> SwapChainStateVk::createSwapChainCi(
     const VulkanDispatch& vk, VkSurfaceKHR surface, VkPhysicalDevice physicalDevice, uint32_t width,
-    uint32_t height, const std::unordered_set<uint32_t>& queueFamilyIndices) {
+    uint32_t height, const std::unordered_set<uint32_t>& queueFamilyIndices,
+    VkSwapchainKHR oldSwapchain) {
     uint32_t formatCount = 0;
     VK_CHECK(
         vk.vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, &formatCount, nullptr));
@@ -351,7 +352,7 @@ std::optional<SwapchainCreateInfoWrapper> SwapChainStateVk::createSwapChainCi(
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
         .presentMode = presentMode,
         .clipped = VK_TRUE,
-        .oldSwapchain = VK_NULL_HANDLE});
+        .oldSwapchain = oldSwapchain});
     if (queueFamilyIndices.empty()) {
         GFXSTREAM_ERROR("Failed to create swapchain: no Vulkan queue family specified.");
         return std::nullopt;

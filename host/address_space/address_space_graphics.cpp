@@ -14,6 +14,7 @@
 
 #include "gfxstream/host/address_space_graphics.h"
 
+#include <cstdlib>
 #include <memory>
 #include <optional>
 
@@ -25,6 +26,36 @@
 
 namespace gfxstream {
 namespace host {
+
+namespace {
+
+bool IsAsgTraceEnabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char* env = std::getenv("QEMU_RUTABAGA_TRACE_ASG");
+        enabled = (env && env[0] && !(env[0] == '0' && env[1] == '\0')) ? 1 : 0;
+    }
+    return enabled;
+}
+
+const char* ConsumerCommandToString(uint32_t cmd) {
+    switch (cmd) {
+        case 0:
+            return "Wakeup";
+        case 1:
+            return "Sleep";
+        case 2:
+            return "Exit";
+        case 3:
+            return "PausePreSnapshot";
+        case 4:
+            return "ResumePostSnapshot";
+        default:
+            return "Unknown";
+    }
+}
+
+}  // namespace
 
 struct AllocationCreateInfo {
     bool virtioGpu;
@@ -434,8 +465,44 @@ private:
 
     void fillBlockLocked(Block& block, struct AllocationCreateInfo& create) {
         if (!create.virtioGpu) {
-            GFXSTREAM_FATAL("Unhandled non virtio-gpu allocation.");
+            // Non-virtio path (goldfish_address_space): allocate a region from
+            // the address-space device's area BAR and resolve the backing HVA
+            // so host and guest share the same memory.
+            const AddressSpaceHwFuncs* hw = gfxstream_address_space_get_hw_funcs();
+            if (!hw) {
+                GFXSTREAM_FATAL("ASG non-virtio alloc: no AddressSpaceHwFuncs");
+            }
+            uint64_t allocSize = create.size ? create.size : kAsgBlockSize;
+            uint64_t offset = 0;
+            if (hw->allocSharedHostRegionLocked(allocSize, &offset)) {
+                GFXSTREAM_FATAL("ASG non-virtio alloc: allocSharedHostRegionLocked failed "
+                                "size=0x%llx", (unsigned long long)allocSize);
+            }
+            uint64_t gpa = hw->getPhysAddrStartLocked() + offset;
+            void* hva = sAddressSpaceDeviceGetHostPtr(gpa);
+            if (!hva) {
+                GFXSTREAM_FATAL("ASG non-virtio alloc: cannot resolve GPA 0x%llx to HVA",
+                                (unsigned long long)gpa);
+            }
+            if (IsAsgTraceEnabled()) {
+                GFXSTREAM_INFO("ASG non-virtio fillBlock size=0x%llx offset=0x%llx "
+                               "gpa=0x%llx hva=%p",
+                               (unsigned long long)allocSize,
+                               (unsigned long long)offset,
+                               (unsigned long long)gpa, hva);
+            }
+            block.external = false;
+            block.buffer = (char*)hva;
+            block.bufferSize = allocSize;
+            block.subAlloc = new SubAllocator(block.buffer, block.bufferSize, kAsgPageSize);
+            block.offsetIntoPhys = gpa;
+            block.isEmpty = false;
+            block.usesVirtioGpuHostmem = false;
+            block.hostmemId = 0;
+            block.dedicatedContextHandle = create.dedicatedContextHandle;
+            return;
         }
+
         if (!create.dedicatedContextHandle) {
             GFXSTREAM_FATAL("Unhandled non virtio-gpu non dedicated allocation.");
         }
@@ -456,7 +523,17 @@ private:
 
     void destroyBlockLocked(Block& block) {
         if (!block.external) {
-            GFXSTREAM_FATAL("Unhandled non-external block.");
+            // Non-virtio path: return the region to the area BAR allocator.
+            const AddressSpaceHwFuncs* hw = gfxstream_address_space_get_hw_funcs();
+            if (hw && block.offsetIntoPhys) {
+                uint64_t offset = block.offsetIntoPhys - hw->getPhysAddrStartLocked();
+                hw->freeSharedHostRegionLocked(offset);
+            }
+            delete block.subAlloc;
+            block.subAlloc = nullptr;
+            block.buffer = nullptr;
+            block.isEmpty = true;
+            return;
         }
 
         delete block.subAlloc;
@@ -501,6 +578,8 @@ AddressSpaceGraphicsContext::AddressSpaceGraphicsContext(
         },
       },
       mConsumerInterface(sGlobals()->getConsumerInterface()) {
+    mHandle = create.handle;
+
     if (create.fromSnapshot) {
         // Use load() instead to initialize
         return;
@@ -609,6 +688,14 @@ void AddressSpaceGraphicsContext::perform(AddressSpaceDevicePingInfo* info) {
         break;
     }
     case ASG_NOTIFY_AVAILABLE:
+        if (IsAsgTraceEnabled()) {
+            GFXSTREAM_INFO(
+                "ASG notify handle=%u virtioCtx=%u name=%s hostmem=0x%llx",
+                mHandle,
+                mVirtioGpuInfo ? mVirtioGpuInfo->contextId : 0,
+                (mVirtioGpuInfo && mVirtioGpuInfo->name) ? mVirtioGpuInfo->name->c_str() : "<none>",
+                static_cast<unsigned long long>(mCombinedAllocation.hostmemId));
+        }
         mConsumerMessages.trySend(ConsumerCommand::Wakeup);
         info->metadata = 0;
         break;
@@ -621,6 +708,14 @@ void AddressSpaceGraphicsContext::perform(AddressSpaceDevicePingInfo* info) {
 AsgOnUnavailableReadStatus AddressSpaceGraphicsContext::onUnavailableRead() {
     ConsumerCommand cmd;
     mConsumerMessages.receive(&cmd);
+    if (IsAsgTraceEnabled()) {
+        GFXSTREAM_INFO(
+            "ASG unavailable-read handle=%u virtioCtx=%u name=%s command=%s",
+            mHandle,
+            mVirtioGpuInfo ? mVirtioGpuInfo->contextId : 0,
+            (mVirtioGpuInfo && mVirtioGpuInfo->name) ? mVirtioGpuInfo->name->c_str() : "<none>",
+            ConsumerCommandToString(cmd));
+    }
     switch (cmd) {
         case ConsumerCommand::Wakeup:
             return AsgOnUnavailableReadStatus::kContinue;

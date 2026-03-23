@@ -30,6 +30,7 @@ class VirtioGpuPipeImpl {
     virtual ~VirtioGpuPipeImpl() = default;
     virtual int TransferToHost(const char* data, size_t dataSize) = 0;
     virtual int TransferFromHost(char* outRequestedData, size_t outRequestedDataSize) = 0;
+    virtual bool CanBeReplacedByServiceRequest() const { return false; }
 };
 
 class VirtioGpuProcessPipe : public VirtioGpuPipeImpl {
@@ -39,6 +40,9 @@ class VirtioGpuProcessPipe : public VirtioGpuPipeImpl {
 
     int TransferToHost(const char* data, size_t dataSize) override;
     int TransferFromHost(char* outRequestedData, size_t outRequestedDataSize) override;
+    bool CanBeReplacedByServiceRequest() const override {
+        return mReceivedConfirmation && mSentUniqueId;
+    }
 
    private:
     VirtioGpuProcessPipe(uint64_t id);

@@ -9,6 +9,7 @@ package(
 cc_library(
     name = "gfxstream_backend_headers",
     hdrs = [
+        "backend/include/gfxstream/host/vm_operations.h",
         "include/gfxstream/virtio-gpu-gfxstream-renderer.h",
         "include/gfxstream/virtio-gpu-gfxstream-renderer-unstable.h",
         "include/render-utils/MediaNative.h",
@@ -110,6 +111,7 @@ cc_library(
         "buffer.cpp",
         "channel_stream.cpp",
         "color_buffer.cpp",
+        "goldfish_pipe/GoldfishPipeService.cpp",
         "frame_buffer.cpp",
         "hwc2.cpp",
         "post_worker.cpp",

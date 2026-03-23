@@ -41,6 +41,10 @@ bool shouldAttemptExternalMemorySharing(GfxstreamFormat format) {
     return !gfxstream::host::IsYuvFormat(format);
 }
 
+bool shouldPreferVkReadback(GfxstreamFormat pixelsFormat) {
+    return pixelsFormat == GfxstreamFormat::R8G8B8A8_UNORM;
+}
+
 }  // namespace
 
 class ColorBuffer::Impl : public LazySnapshotObj<ColorBuffer::Impl> {
@@ -264,6 +268,14 @@ void ColorBuffer::Impl::readToBytes(
         uint64_t outPixelsSize) {
     touch();
 
+    if (mColorBufferVk && shouldPreferVkReadback(pixelsFormat)) {
+        if (!invalidateForVk()) {
+            GFXSTREAM_FATAL("Failed to sync ColorBuffer:%d for Vulkan readback.", mHandle);
+        }
+        mColorBufferVk->readToBytes(x, y, width, height, outPixels, outPixelsSize);
+        return;
+    }
+
 #if GFXSTREAM_ENABLE_HOST_GLES
     if (mColorBufferGl) {
         mColorBufferGl->readPixels(x, y, width, height, pixelsFormat, outPixels);
@@ -293,7 +305,17 @@ void ColorBuffer::Impl::readToBytesScaled(
 #endif
 
     if (mColorBufferVk) {
-        mColorBufferVk->readPixelsScaled(pixelsWidth, pixelsHeight, pixelsRotation, rect, pixelsFormat, outPixels, colorTransform);
+        if (!invalidateForVk()) {
+            GFXSTREAM_FATAL("Failed to sync ColorBuffer:%d for scaled Vulkan readback.", mHandle);
+        }
+        if (!shouldPreferVkReadback(pixelsFormat)) {
+            GFXSTREAM_ERROR(
+                "Readback is not supported for Vulkan ColorBuffer with format: %s.",
+                ToString(pixelsFormat).c_str());
+            return;
+        }
+        mColorBufferVk->readPixelsScaled(pixelsWidth, pixelsHeight, pixelsRotation, rect,
+                                         pixelsFormat, outPixels, colorTransform);
         return;
     }
 
@@ -312,6 +334,9 @@ void ColorBuffer::Impl::readYuvToBytes(int x, int y, int width, int height, void
 #endif
 
     if (mColorBufferVk) {
+        if (!invalidateForVk()) {
+            GFXSTREAM_FATAL("Failed to sync ColorBuffer:%d for Vulkan YUV readback.", mHandle);
+        }
         mColorBufferVk->readToBytes(x, y, width, height, outPixels, outPixelsSize);
         return;
     }

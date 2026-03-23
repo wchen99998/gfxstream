@@ -54,6 +54,24 @@ struct stream_renderer_param_host_visible_memory_mask {
 // terminated string of the form "<feature1 name>:[enabled|disabled],<feature 2 ...>".
 #define STREAM_RENDERER_PARAM_RENDERER_FEATURES 11
 
+// STREAM_RENDERER_PARAM_GFXSTREAM_VM_OPS: stream_renderer_param::value is a pointer to a
+// gfxstream_vm_ops struct.
+#define STREAM_RENDERER_PARAM_GFXSTREAM_VM_OPS 12
+
+// STREAM_RENDERER_PARAM_ADDRESS_SPACE_HW_FUNCS: stream_renderer_param::value is a pointer to an
+// AddressSpaceHwFuncs struct.
+#define STREAM_RENDERER_PARAM_ADDRESS_SPACE_HW_FUNCS 13
+
+// STREAM_RENDERER_PARAM_DISPLAY_WIDTH_MM / _HEIGHT_MM: physical display size in millimeters.
+#define STREAM_RENDERER_PARAM_DISPLAY_WIDTH_MM 14
+#define STREAM_RENDERER_PARAM_DISPLAY_HEIGHT_MM 15
+
+#define STREAM_RENDERER_PARAM_METRICS_CALLBACK_SET_ANNOTATION 1028
+typedef void (*stream_renderer_param_metrics_callback_set_annotation)(const char* key,
+                                                                      const char* value);
+
+#define STREAM_RENDERER_PARAM_METRICS_CALLBACK_ABORT 1029
+typedef void (*stream_renderer_param_metrics_callback_abort)();
 VG_EXPORT void gfxstream_backend_setup_window(void* native_window_handle, int32_t window_x,
                                               int32_t window_y, int32_t window_width,
                                               int32_t window_height, int32_t fb_width,
@@ -111,6 +129,14 @@ VG_EXPORT int stream_renderer_snapshot(const char* dir);
 VG_EXPORT int stream_renderer_restore(const char* dir);
 
 VG_EXPORT int stream_renderer_resume();
+
+// Returns the active address-space control ops table used by gfxstream.
+// The pointer is opaque to C callers.
+VG_EXPORT const void* stream_renderer_get_address_space_device_control_ops(void);
+
+// Overrides the address-space HW funcs table used by allocator-backed ASG
+// contexts. Returns the previous opaque HW funcs pointer.
+VG_EXPORT const void* stream_renderer_set_address_space_hw_funcs(const void* hw_funcs);
 
 // Matches Resource3DInfo in rutabaga_gfx
 struct stream_renderer_3d_info {

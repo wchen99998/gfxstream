@@ -14,6 +14,8 @@
 
 #include "gfxstream/host/vm_operations.h"
 
+#include "gfxstream/host/dma_device.h"
+
 namespace gfxstream {
 namespace host {
 namespace {
@@ -47,6 +49,9 @@ gfxstream_vm_ops sGfxstreamVmOps = {
 
 void set_gfxstream_vm_operations(const gfxstream_vm_ops& ops) {
     sGfxstreamVmOps = ops;
+    set_gfxstream_dma_get_host_addr(ops.lookup_user_memory ?
+                                    ops.lookup_user_memory :
+                                    DefaultLookupUserMemory);
 }
 
 const gfxstream_vm_ops& get_gfxstream_vm_operations() {

@@ -28,7 +28,9 @@ if (NOT TARGET gfxstream_host_address_space)
     add_library(
         gfxstream_host_address_space
         address_space_device.cpp
+        address_space_host_memory_allocator.cpp
         address_space_graphics.cpp
+        address_space_shared_slots_host_memory_allocator.cpp
         ring_buffer.cpp
         sub_allocator.cpp)
     target_link_libraries(
@@ -37,4 +39,17 @@ if (NOT TARGET gfxstream_host_address_space)
         gfxstream_common_base
         gfxstream_host_address_space.headers
         gfxstream_common_logging)
+
+    if (ENABLE_VKCEREAL_TESTS)
+        add_executable(
+            gfxstream_host_address_space_unittests
+            address_space_host_memory_allocator_unittest.cpp
+            address_space_shared_slots_host_memory_allocator_unittest.cpp
+            ring_buffer_unittest.cpp)
+        target_link_libraries(
+            gfxstream_host_address_space_unittests
+            PUBLIC
+            gfxstream_host_address_space
+            gtest_main)
+    endif()
 endif()

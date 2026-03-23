@@ -15,18 +15,25 @@
 extern "C" {
 #include "gfxstream/virtio-gpu-gfxstream-renderer-unstable.h"
 #include "gfxstream/virtio-gpu-gfxstream-renderer.h"
+#include "gfxstream/virtio-gpu-gfxstream-renderer-goldfish.h"
 }  // extern "C"
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string_view>
 
 #include "frame_buffer.h"
+#include "goldfish_pipe/GoldfishPipeService.h"
+#include "gfxstream/Metrics.h"
 #include "gfxstream/strings.h"
 #include "gfxstream/common/logging.h"
+#include "gfxstream/host/address_space_device.h"
 #include "gfxstream/host/features.h"
+#include "gfxstream/host/address_space_operations.h"
 #include "gfxstream/host/tracing.h"
 #include "gfxstream/host/address_space_graphics.h"
+#include "gfxstream/host/vm_operations.h"
 #include "gfxstream/memory/UdmabufCreator.h"
 #include "gfxstream/system/System.h"
 #ifdef CONFIG_AEMU
@@ -54,6 +61,23 @@ static VirtioGpuFrontend* sFrontend() {
     return p;
 }
 
+static int DisplayDpiFromMillimeters(uint32_t pixels, uint32_t millimeters) {
+    if (!pixels || !millimeters) {
+        return 160;
+    }
+
+    const uint64_t numerator = static_cast<uint64_t>(pixels) * 254 + millimeters * 5;
+    const uint64_t denominator = static_cast<uint64_t>(millimeters) * 10;
+    const uint64_t dpi = denominator ? numerator / denominator : 160;
+    if (!dpi) {
+        return 160;
+    }
+    if (dpi > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+        return std::numeric_limits<int>::max();
+    }
+    return static_cast<int>(dpi);
+}
+
 std::optional<gfxstream::host::FeatureSet>
 ParseGfxstreamFeatures(const int rendererFlags,
                         const std::string& rendererFeatures) {
@@ -61,6 +85,10 @@ ParseGfxstreamFeatures(const int rendererFlags,
         gfxstream::base::setEnvironmentVariable("ANDROID_EGL_ON_EGL", "1");
         gfxstream::base::setEnvironmentVariable("ANDROID_EMUGL_VERBOSE", "1");
     }
+    const bool forceEglOnEgl =
+        gfxstream::base::getEnvironmentVariable("ANDROID_EGL_ON_EGL") == "1";
+    const bool enableEglOnEgl =
+        (rendererFlags & STREAM_RENDERER_FLAGS_USE_EGL_BIT) || forceEglOnEgl;
     const bool useNativeWindow =
         rendererFlags & STREAM_RENDERER_FLAGS_VULKAN_NATIVE_SWAPCHAIN_BIT;
 
@@ -70,9 +98,7 @@ ParseGfxstreamFeatures(const int rendererFlags,
 
     gfxstream::host::FeatureSet features;
     GFXSTREAM_SET_FEATURE_ON_CONDITION(
-        &features, EglOnEgl,
-        rendererFlags & STREAM_RENDERER_FLAGS_USE_EGL_BIT ||
-        gfxstream::base::getEnvironmentVariable("ANDROID_EGL_ON_EGL") == "1");
+        &features, EglOnEgl, enableEglOnEgl);
     GFXSTREAM_SET_FEATURE_ON_CONDITION(&features, VulkanExternalSync,
                                        rendererFlags & STREAM_RENDERER_FLAGS_VULKAN_EXTERNAL_SYNC);
     GFXSTREAM_SET_FEATURE_ON_CONDITION(
@@ -90,6 +116,9 @@ ParseGfxstreamFeatures(const int rendererFlags,
         (rendererFlags & STREAM_RENDERER_FLAGS_USE_VK_BIT) &&
         !(rendererFlags & STREAM_RENDERER_FLAGS_USE_GLES_BIT));
     GFXSTREAM_SET_FEATURE_ON_CONDITION(
+        &features, HasSharedSlotsHostMemoryAllocator,
+        gfxstream::host::gfxstream_address_space_get_hw_funcs() != nullptr);
+    GFXSTREAM_SET_FEATURE_ON_CONDITION(
         &features, HostComposition, true);
     GFXSTREAM_SET_FEATURE_ON_CONDITION(
         &features, NativeTextureDecompression, false);
@@ -97,7 +126,7 @@ ParseGfxstreamFeatures(const int rendererFlags,
         &features, NoDelayCloseColorBuffer, true);
     GFXSTREAM_SET_FEATURE_ON_CONDITION(
         &features, RefCountPipe,
-        /*Resources are ref counted via guest file objects.*/ false);
+        /*Resources are ref counted via goldfish pipe refcount service.*/ true);
     GFXSTREAM_SET_FEATURE_ON_CONDITION(
         &features, SystemBlob,
         rendererFlags & STREAM_RENDERER_FLAGS_USE_SYSTEM_BLOB);
@@ -605,6 +634,46 @@ VG_EXPORT int stream_renderer_resume() {
     return 0;
 }
 
+VG_EXPORT const void* stream_renderer_get_address_space_device_control_ops() {
+    return &gfxstream::get_gfxstream_address_space_ops();
+}
+
+VG_EXPORT const void* stream_renderer_set_address_space_hw_funcs(const void* hw_funcs) {
+    return gfxstream::host::gfxstream_address_space_set_hw_funcs(
+        reinterpret_cast<const AddressSpaceHwFuncs*>(hw_funcs));
+}
+
+// --- Goldfish pipe service ops -------------------------------------------
+
+static const GoldfishPipeServiceOps* s_goldfish_pipe_service_ops = nullptr;
+
+VG_EXPORT const GoldfishPipeServiceOps* stream_renderer_set_service_ops(
+        const GoldfishPipeServiceOps* ops) {
+    const GoldfishPipeServiceOps* prev = s_goldfish_pipe_service_ops;
+    s_goldfish_pipe_service_ops = ops;
+    GFXSTREAM_INFO("Goldfish pipe service ops %s",
+                   ops ? "installed" : "cleared");
+    return prev;
+}
+
+VG_EXPORT const GoldfishPipeServiceOps* stream_renderer_get_service_ops(void) {
+    return s_goldfish_pipe_service_ops;
+}
+
+static const GoldfishPipeHwFuncs* s_goldfish_pipe_hw_funcs = nullptr;
+
+VG_EXPORT const GoldfishPipeHwFuncs* stream_renderer_set_service_hw_funcs(
+        const GoldfishPipeHwFuncs* hw_funcs) {
+    const GoldfishPipeHwFuncs* prev = s_goldfish_pipe_hw_funcs;
+    s_goldfish_pipe_hw_funcs = hw_funcs;
+    return prev;
+}
+
+/* Called by the service bridge to look up the installed hw funcs. */
+extern "C" const GoldfishPipeHwFuncs* stream_renderer_get_service_hw_funcs(void) {
+    return s_goldfish_pipe_hw_funcs;
+}
+
 VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer_params,
                                    uint64_t num_params) {
     // Required parameters.
@@ -621,7 +690,20 @@ VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer
         {STREAM_RENDERER_PARAM_WIN0_HEIGHT, "WIN0_HEIGHT"},
         {STREAM_RENDERER_PARAM_DEBUG_CALLBACK, "DEBUG_CALLBACK"},
         {STREAM_RENDERER_SKIP_OPENGLES_INIT, "SKIP_OPENGLES_INIT"},
-    };
+        {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT,
+         "METRICS_CALLBACK_ADD_INSTANT_EVENT"},
+        {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_DESCRIPTOR,
+         "METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_DESCRIPTOR"},
+        {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_METRIC,
+         "METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_METRIC"},
+        {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_VULKAN_OUT_OF_MEMORY_EVENT,
+         "METRICS_CALLBACK_ADD_VULKAN_OUT_OF_MEMORY_EVENT"},
+        {STREAM_RENDERER_PARAM_GFXSTREAM_VM_OPS, "GFXSTREAM_VM_OPS"},
+        {STREAM_RENDERER_PARAM_ADDRESS_SPACE_HW_FUNCS, "ADDRESS_SPACE_HW_FUNCS"},
+        {STREAM_RENDERER_PARAM_DISPLAY_WIDTH_MM, "DISPLAY_WIDTH_MM"},
+        {STREAM_RENDERER_PARAM_DISPLAY_HEIGHT_MM, "DISPLAY_HEIGHT_MM"},
+        {STREAM_RENDERER_PARAM_METRICS_CALLBACK_SET_ANNOTATION, "METRICS_CALLBACK_SET_ANNOTATION"},
+        {STREAM_RENDERER_PARAM_METRICS_CALLBACK_ABORT, "METRICS_CALLBACK_ABORT"}};
 
     // Print full values for these parameters:
     // Values here must not be pointers (e.g. callback functions), to avoid potentially identifying
@@ -645,12 +727,16 @@ VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer
     // Initialization data.
     uint32_t display_width = 0;
     uint32_t display_height = 0;
+    uint32_t display_width_mm = 0;
+    uint32_t display_height_mm = 0;
     void* renderer_cookie = nullptr;
     int renderer_flags = 0;
     std::string renderer_features_str;
     stream_renderer_fence_callback fence_callback = nullptr;
     stream_renderer_debug_callback log_callback = nullptr;
     bool rendererInitializedExternally = false;
+    const gfxstream_vm_ops* vmOps = nullptr;
+    const AddressSpaceHwFuncs* addressSpaceHwFuncs = nullptr;
 
     // Iterate all parameters that we support.
     GFXSTREAM_DEBUG("Reading stream renderer parameters:");
@@ -695,6 +781,14 @@ VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer
                 display_height = static_cast<uint32_t>(param.value);
                 break;
             }
+            case STREAM_RENDERER_PARAM_DISPLAY_WIDTH_MM: {
+                display_width_mm = static_cast<uint32_t>(param.value);
+                break;
+            }
+            case STREAM_RENDERER_PARAM_DISPLAY_HEIGHT_MM: {
+                display_height_mm = static_cast<uint32_t>(param.value);
+                break;
+            }
             case STREAM_RENDERER_PARAM_DEBUG_CALLBACK: {
                 log_callback = reinterpret_cast<stream_renderer_debug_callback>(
                     static_cast<uintptr_t>(param.value));
@@ -709,6 +803,29 @@ VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer
             case STREAM_RENDERER_PARAM_RENDERER_FEATURES: {
                 renderer_features_str =
                     std::string(reinterpret_cast<const char*>(static_cast<uintptr_t>(param.value)));
+                break;
+            }
+            case STREAM_RENDERER_PARAM_GFXSTREAM_VM_OPS: {
+                vmOps = reinterpret_cast<const gfxstream_vm_ops*>(
+                    static_cast<uintptr_t>(param.value));
+                break;
+            }
+            case STREAM_RENDERER_PARAM_ADDRESS_SPACE_HW_FUNCS: {
+                addressSpaceHwFuncs = reinterpret_cast<const AddressSpaceHwFuncs*>(
+                    static_cast<uintptr_t>(param.value));
+                break;
+            }
+            case STREAM_RENDERER_PARAM_METRICS_CALLBACK_SET_ANNOTATION: {
+                MetricsLogger::set_crash_annotation_callback =
+                    reinterpret_cast<stream_renderer_param_metrics_callback_set_annotation>(
+                        static_cast<uintptr_t>(param.value));
+                break;
+            }
+            case STREAM_RENDERER_PARAM_METRICS_CALLBACK_ABORT: {
+                GFXSTREAM_FATAL(
+                    "Deprecated STREAM_RENDERER_PARAM_METRICS_CALLBACK_ABORT. "
+                    "Use STREAM_RENDERER_PARAM_DEBUG_CALLBACK instead which includes "
+                    "fatal logs.");
                 break;
             }
             default: {
@@ -775,6 +892,30 @@ VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer
         return -EINVAL;
     }
 
+    const gfxstream_vm_ops previousVmOps = gfxstream::get_gfxstream_vm_operations();
+    const AddressSpaceHwFuncs* previousAddressSpaceHwFuncs =
+        gfxstream::host::gfxstream_address_space_get_hw_funcs();
+    const bool vmOpsInstalled = vmOps != nullptr;
+    const bool addressSpaceHwFuncsInstalled = addressSpaceHwFuncs != nullptr;
+    const auto restoreGlobalHooks = [&]() {
+        if (vmOpsInstalled) {
+            gfxstream::set_gfxstream_vm_operations(previousVmOps);
+        }
+        if (addressSpaceHwFuncsInstalled) {
+            gfxstream::host::gfxstream_address_space_set_hw_funcs(previousAddressSpaceHwFuncs);
+        }
+    };
+
+    if (vmOpsInstalled) {
+        gfxstream::set_gfxstream_vm_operations(*vmOps);
+        GFXSTREAM_INFO("Configured gfxstream VM ops lookup_user_memory=%p",
+                       reinterpret_cast<const void*>(vmOps->lookup_user_memory));
+    }
+    if (addressSpaceHwFuncsInstalled) {
+        gfxstream::host::gfxstream_address_space_set_hw_funcs(addressSpaceHwFuncs);
+        GFXSTREAM_INFO("Configured gfxstream address-space HW funcs=%p", addressSpaceHwFuncs);
+    }
+
 #if GFXSTREAM_UNSTABLE_VULKAN_EXTERNAL_SYNC
     renderer_flags |= STREAM_RENDERER_FLAGS_VULKAN_EXTERNAL_SYNC;
 #endif
@@ -783,6 +924,7 @@ VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer
                                             renderer_features_str,
                                             rendererInitializedExternally);
     if (!featuresOpt) {
+        restoreGlobalHooks();
         GFXSTREAM_ERROR("Failed to initialize: failed to get Gfxstream features.");
         return -EINVAL;
     }
@@ -796,6 +938,8 @@ VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer
                            featureInfo->reason.c_str());
         }
     }
+    GFXSTREAM_INFO("Gfxstream renderControl DMA readback eligibility: hw-funcs=%p",
+                   gfxstream::host::gfxstream_address_space_get_hw_funcs());
 
     gfxstream::host::InitializeTracing();
 
@@ -820,15 +964,27 @@ VG_EXPORT int stream_renderer_init(struct stream_renderer_param* stream_renderer
     auto renderer = GetRenderer(display_width, display_height, renderer_flags, features,
                                 rendererInitializedExternally);
     if (!renderer) {
+        restoreGlobalHooks();
         GFXSTREAM_ERROR("Failed to initialize Gfxstream renderer!");
         return -EINVAL;
     }
+
+    renderer->setDisplayConfigs(0, display_width, display_height,
+                                DisplayDpiFromMillimeters(display_width, display_width_mm),
+                                DisplayDpiFromMillimeters(display_height, display_height_mm));
+    renderer->setDisplayActiveConfig(0);
 
     sFrontend()->init(renderer, renderer_cookie, features, fence_callback);
 
     const bool useNativeWindow =
         renderer_flags & STREAM_RENDERER_FLAGS_VULKAN_NATIVE_SWAPCHAIN_BIT;
     sFrontend()->setNativeWindowEnabled(useNativeWindow);
+
+    // Initialize the goldfish pipe service registry and install the ops.
+    // This makes the refcount, opengles, and GLProcessPipe services available
+    // to the QEMU goldfish_pipe device through the rutabaga FFI bridge.
+    const auto* pipe_ops = gfxstream::host::goldfish_pipe_service_init(renderer);
+    stream_renderer_set_service_ops(pipe_ops);
 
     GFXSTREAM_INFO("Gfxstream initialized successfully!");
     return 0;

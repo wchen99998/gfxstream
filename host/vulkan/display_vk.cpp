@@ -40,6 +40,13 @@ namespace vk {
 
 namespace {
 
+struct LetterboxRect {
+    uint32_t x;
+    uint32_t y;
+    uint32_t width;
+    uint32_t height;
+};
+
 bool shouldRecreateSwapchain(VkResult result) {
     switch (result) {
         case VK_SUBOPTIMAL_KHR:
@@ -52,6 +59,36 @@ bool shouldRecreateSwapchain(VkResult result) {
         default:
             return false;
     }
+}
+
+LetterboxRect getLetterboxRect(uint32_t srcWidth, uint32_t srcHeight,
+                               uint32_t dstWidth, uint32_t dstHeight) {
+    if (!srcWidth || !srcHeight || !dstWidth || !dstHeight) {
+        return {
+            .x = 0,
+            .y = 0,
+            .width = dstWidth,
+            .height = dstHeight,
+        };
+    }
+
+    if ((uint64_t)dstWidth * srcHeight > (uint64_t)dstHeight * srcWidth) {
+        uint32_t width = (uint32_t)((uint64_t)dstHeight * srcWidth / srcHeight);
+        return {
+            .x = (dstWidth - width) / 2,
+            .y = 0,
+            .width = width,
+            .height = dstHeight,
+        };
+    }
+
+    uint32_t height = (uint32_t)((uint64_t)dstWidth * srcHeight / srcWidth);
+    return {
+        .x = 0,
+        .y = (dstHeight - height) / 2,
+        .width = dstWidth,
+        .height = height,
+    };
 }
 
 }  // namespace
@@ -165,8 +202,8 @@ bool DisplayVk::recreateSwapchain() {
     m_swapChainStateVk =
         SwapChainStateVk::createSwapChainVk(m_vk, m_vkDevice, swapChainCi->mCreateInfo);
     if (m_swapChainStateVk == nullptr) return false;
-    int numSwapChainImages = m_swapChainStateVk->getVkImages().size();
 
+    const int numSwapChainImages = m_swapChainStateVk->getVkImages().size();
     m_postResourceFutures.resize(numSwapChainImages, std::nullopt);
     for (int i = 0; i < numSwapChainImages + 1; ++i) {
         m_freePostResources.emplace_back(PostResource::create(m_vk, m_vkDevice, m_vkCommandPool));
@@ -394,7 +431,6 @@ DisplayVk::PostResult DisplayVk::postImpl(
             }
             m_freePostResources.emplace_back(postResourceFutureOpt.value().get());
             postResourceFutureOpt = std::nullopt;
-            break;
         }
     }
     std::shared_ptr<PostResource> postResource = m_freePostResources.front();
@@ -443,6 +479,14 @@ DisplayVk::PostResult DisplayVk::postImpl(
     // surface resized. The blit must not try to write outside of the extent of the
     // existing swapchain images.
     const VkExtent2D swapchainImageExtent = m_swapChainStateVk->getImageExtent();
+    const LetterboxRect presentRect = getLetterboxRect(
+        sourceImageInfoVk->imageCreateInfo.extent.width,
+        sourceImageInfoVk->imageCreateInfo.extent.height, swapchainImageExtent.width,
+        swapchainImageExtent.height);
+    const bool needsLetterboxClear =
+        presentRect.x != 0 || presentRect.y != 0 ||
+        presentRect.width != swapchainImageExtent.width ||
+        presentRect.height != swapchainImageExtent.height;
 
     CompositorVkBase::ImmediateModeResources* imResources =
         m_compositorVk ? m_compositorVk->acquireImmediateModeResources() : nullptr;
@@ -505,6 +549,14 @@ DisplayVk::PostResult DisplayVk::postImpl(
         currentSwapchainLayout = acquireSwapchainImageBarrier.newLayout;
         curSrcAccessMask = acquireSwapchainImageBarrier.dstAccessMask;
 
+        if (needsLetterboxClear) {
+            const VkClearColorValue clearColor = {
+                .float32 = {0.0f, 0.0f, 0.0f, 1.0f},
+            };
+            m_vk.vkCmdClearColorImage(cmdBuff, currentSwapchainImage, currentSwapchainLayout,
+                                      &clearColor, 1, &subresourceRange);
+        }
+
         const VkImageBlit region = {
             .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
                                .mipLevel = 0,
@@ -518,9 +570,10 @@ DisplayVk::PostResult DisplayVk::postImpl(
                                .mipLevel = 0,
                                .baseArrayLayer = 0,
                                .layerCount = 1},
-            .dstOffsets = {{0, 0, 0},
-                           {static_cast<int32_t>(swapchainImageExtent.width),
-                            static_cast<int32_t>(swapchainImageExtent.height), 1}},
+            .dstOffsets = {{static_cast<int32_t>(presentRect.x),
+                            static_cast<int32_t>(presentRect.y), 0},
+                           {static_cast<int32_t>(presentRect.x + presentRect.width),
+                            static_cast<int32_t>(presentRect.y + presentRect.height), 1}},
         };
         VkFormat displayBufferFormat = sourceImageInfoVk->imageCreateInfo.format;
         VkImageTiling displayBufferTiling = sourceImageInfoVk->imageCreateInfo.tiling;

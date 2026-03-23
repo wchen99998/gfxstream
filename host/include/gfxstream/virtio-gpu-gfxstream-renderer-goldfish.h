@@ -14,16 +14,26 @@
 
 #pragma once
 
-#include <cstdint>
-
+#include "gfxstream/goldfish_pipe.h"
 #include "gfxstream/virtio-gpu-gfxstream-renderer.h"
-#include "host-common/goldfish_pipe.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-VG_EXPORT void stream_renderer_set_service_ops(const GoldfishPipeServiceOps* ops);
+/* Install the host service ops table.  Returns the previously installed
+ * table, or NULL.  The caller must ensure the ops table outlives any
+ * active pipe connections. */
+VG_EXPORT const GoldfishPipeServiceOps* stream_renderer_set_service_ops(
+    const GoldfishPipeServiceOps* ops);
+
+/* Retrieve the currently active service ops table (may be NULL). */
+VG_EXPORT const GoldfishPipeServiceOps* stream_renderer_get_service_ops(void);
+
+/* Install hardware-side callbacks so the host service bridge can signal
+ * wake events back to the virtual device.  Returns the previous pointer. */
+VG_EXPORT const GoldfishPipeHwFuncs* stream_renderer_set_service_hw_funcs(
+    const GoldfishPipeHwFuncs* hw_funcs);
 
 #ifdef __cplusplus
 }  // extern "C"

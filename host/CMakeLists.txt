@@ -82,6 +82,7 @@ set(stream-server-core-sources
     virtio_gpu_context.cpp
     virtio_gpu_frontend.cpp
     virtio_gpu_pipe.cpp
+    goldfish_pipe/GoldfishPipeService.cpp
     virtio_gpu_resource.cpp
     virtio_gpu_ring_blob.cpp
     virtio_gpu_timelines.cpp

@@ -84,6 +84,7 @@ class AddressSpaceGraphicsContext : public AddressSpaceDeviceContext {
     AsgOnUnavailableReadStatus onUnavailableRead();
 
     // Data layout
+    uint32_t mHandle = 0;
     uint32_t mVersion = 1;
     Allocation mRingAllocation;
     Allocation mBufferAllocation;

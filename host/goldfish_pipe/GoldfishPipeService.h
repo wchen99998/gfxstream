@@ -1,4 +1,4 @@
-// Copyright (C) 2025 The Android Open Source Project
+// Copyright 2025 The Android Open Source Project
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,14 +14,22 @@
 
 #pragma once
 
-#include "render-utils/window_operations.h"
+#include <memory>
+
+#include "gfxstream/goldfish_pipe.h"
+#include "render-utils/Renderer.h"
 
 namespace gfxstream {
 namespace host {
 
-void set_gfxstream_window_operations(const gfxstream_window_ops& ops);
-const gfxstream_window_ops& get_gfxstream_window_operations();
-bool gfxstream_window_has_ui_thread_ops();
+// Initialize the goldfish pipe service registry.
+// |renderer| is used by the opengles service to create RenderChannels.
+// Registers the built-in services (refcount, opengles, GLProcessPipe) and
+// returns a GoldfishPipeServiceOps table that can be installed into the
+// virtual device via stream_renderer_set_service_ops().
+//
+// The returned pointer is a process-lifetime singleton – it must not be freed.
+const GoldfishPipeServiceOps* goldfish_pipe_service_init(RendererPtr renderer);
 
 }  // namespace host
 }  // namespace gfxstream

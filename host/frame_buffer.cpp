@@ -121,10 +121,19 @@ using gfxstream::host::vk::PostWorkerVk;
 
 bool postOnlyOnMainThread() {
 #if defined(__APPLE__) && !defined(QEMU_NEXT)
-    return true;
+    return gfxstream_window_has_ui_thread_ops();
 #else
     return false;
 #endif
+}
+
+bool isPresentTraceEnabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char* env = std::getenv("QEMU_RUTABAGA_TRACE_PRESENT");
+        enabled = (env && env[0] && !(env[0] == '0' && env[1] == '\0')) ? 1 : 0;
+    }
+    return enabled;
 }
 
 static FrameBuffer* sFrameBuffer = NULL;
@@ -1712,7 +1721,13 @@ bool FrameBuffer::Impl::setupSubWindow(FBNativeWindowType p_window, int wx, int 
     {
         blockPostWorker(std::move(postWorkerContinueSignalFuture)).wait();
     }
-    if (m_displayVk) {
+    if (m_displayVk && shouldCreateSubWindow) {
+        // Replacing the native surface still needs a hard drain, but in-place
+        // resizes keep the existing surface and let DisplayVk hand off to a
+        // new swapchain on the next post.
+        auto watchdog = WATCHDOG_BUILDER(m_healthMonitor.get(), "Draining the VkQueue")
+                            .setTimeoutMs(6000)
+                            .build();
         m_displayVk->drainQueues();
     }
 
@@ -2514,14 +2529,43 @@ bool FrameBuffer::Impl::updateColorBufferDeprecated(HandleType colorbuffer, int 
 }
 
 bool FrameBuffer::Impl::post(HandleType p_colorbuffer, bool needLockAndBind) {
+#if GFXSTREAM_ENABLE_HOST_GLES
+    if (m_features.GuestVulkanOnly.enabled) {
+        flushColorBufferFromGl(p_colorbuffer);
+    }
+#endif
+
+    if (isPresentTraceEnabled()) {
+        GFXSTREAM_INFO("PRESENT FrameBuffer::post colorBuffer=%u needLockAndBind=%d",
+                       p_colorbuffer, needLockAndBind ? 1 : 0);
+    }
     auto res = postImplSync(p_colorbuffer, needLockAndBind);
+    if (isPresentTraceEnabled()) {
+        GFXSTREAM_INFO("PRESENT FrameBuffer::post colorBuffer=%u result=%d",
+                       p_colorbuffer, res ? 1 : 0);
+    }
     if (res) setGuestPostedAFrame();
     return res;
 }
 
 void FrameBuffer::Impl::postWithCallback(HandleType p_colorbuffer,
                                          Post::CompletionCallback callback, bool needLockAndBind) {
+#if GFXSTREAM_ENABLE_HOST_GLES
+    if (m_features.GuestVulkanOnly.enabled) {
+        flushColorBufferFromGl(p_colorbuffer);
+    }
+#endif
+
+    if (isPresentTraceEnabled()) {
+        GFXSTREAM_INFO("PRESENT FrameBuffer::postWithCallback colorBuffer=%u needLockAndBind=%d",
+                       p_colorbuffer, needLockAndBind ? 1 : 0);
+    }
     AsyncResult res = postImpl(p_colorbuffer, callback, needLockAndBind);
+    if (isPresentTraceEnabled()) {
+        GFXSTREAM_INFO(
+            "PRESENT FrameBuffer::postWithCallback colorBuffer=%u succeeded=%d callback=%d",
+            p_colorbuffer, res.Succeeded() ? 1 : 0, res.CallbackScheduledOrFired() ? 1 : 0);
+    }
     if (res.Succeeded()) {
         setGuestPostedAFrame();
     }
@@ -2936,6 +2980,28 @@ bool FrameBuffer::Impl::decColorBufferRefCountLocked(HandleType p_colorbuffer) {
 }
 
 bool FrameBuffer::Impl::compose(uint32_t bufferSize, void* buffer, bool needPost) {
+    ComposeDevice* composeDevice = reinterpret_cast<ComposeDevice*>(buffer);
+    if (isPresentTraceEnabled() && composeDevice) {
+        switch (composeDevice->version) {
+            case 1:
+                GFXSTREAM_INFO("PRESENT FrameBuffer::compose version=1 target=%u needPost=%d",
+                               composeDevice->targetHandle, needPost ? 1 : 0);
+                break;
+            case 2: {
+                auto* composeDeviceV2 = reinterpret_cast<ComposeDevice_v2*>(buffer);
+                GFXSTREAM_INFO(
+                    "PRESENT FrameBuffer::compose version=2 display=%u target=%u needPost=%d",
+                    composeDeviceV2->displayId, composeDeviceV2->targetHandle,
+                    needPost ? 1 : 0);
+                break;
+            }
+            default:
+                GFXSTREAM_INFO("PRESENT FrameBuffer::compose version=%u needPost=%d",
+                               composeDevice->version, needPost ? 1 : 0);
+                break;
+        }
+    }
+
     std::promise<void> promise;
     std::future<void> completeFuture = promise.get_future();
     auto composeRes =
@@ -2951,13 +3017,9 @@ bool FrameBuffer::Impl::compose(uint32_t bufferSize, void* buffer, bool needPost
         completeFuture.wait();
     }
 
-#ifdef CONFIG_AEMU
     const auto& multiDisplay = get_gfxstream_multi_display_operations();
     const bool is_pixel_fold = multiDisplay.is_pixel_fold();
     if (needPost) {
-        // AEMU with -no-window mode uses this code path.
-        ComposeDevice* composeDevice = (ComposeDevice*)buffer;
-
         switch (composeDevice->version) {
             case 1: {
                 post(composeDevice->targetHandle, true);
@@ -2975,7 +3037,6 @@ bool FrameBuffer::Impl::compose(uint32_t bufferSize, void* buffer, bool needPost
             }
         }
     }
-#endif
 
     return true;
 }
@@ -3498,8 +3559,13 @@ int FrameBuffer::Impl::destroyDisplay(uint32_t displayId) {
 }
 
 int FrameBuffer::Impl::setDisplayColorBuffer(uint32_t displayId, uint32_t colorBuffer) {
-    return get_gfxstream_multi_display_operations().set_display_color_buffer(displayId,
-                                                                             colorBuffer);
+    int ret = get_gfxstream_multi_display_operations().set_display_color_buffer(displayId,
+                                                                                colorBuffer);
+    if (isPresentTraceEnabled()) {
+        GFXSTREAM_INFO("PRESENT FrameBuffer::setDisplayColorBuffer display=%u colorBuffer=%u ret=%d",
+                       displayId, colorBuffer, ret);
+    }
+    return ret;
 }
 
 int FrameBuffer::Impl::getDisplayColorBuffer(uint32_t displayId, uint32_t* colorBuffer) {

@@ -90,7 +90,9 @@ public:
     GLint mTranslationSlot;
     GLuint mVertexBuffer;
     GLuint mIndexBuffer;
+    GLuint mVertexArray;
     GLuint mColorTransform;
+    bool mUseCoreProfile;
 
     struct TexturedLayer {
         std::mutex mMutex;
