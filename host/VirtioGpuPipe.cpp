@@ -15,26 +15,38 @@
 #include "VirtioGpuPipe.h"
 
 #include <cstring>
+#include <limits>
 
 #include "gfxstream/common/logging.h"
 #include "gfxstream/system/System.h"
 
 namespace gfxstream {
 namespace host {
+namespace {
+
+constexpr uint64_t kInvalidPuid = std::numeric_limits<uint64_t>::max();
+
+bool IsPipeTypeMessage(const char* data, size_t dataSize) {
+    constexpr char kPipePrefix[] = "pipe:";
+    return dataSize >= sizeof(kPipePrefix) - 1 &&
+           std::memcmp(data, kPipePrefix, sizeof(kPipePrefix) - 1) == 0;
+}
+
+}  // namespace
 
 /*static*/
 std::unique_ptr<VirtioGpuPipeImpl> VirtioGpuProcessPipe::Create(VirtioGpuContextId id) {
-    static std::atomic<uint64_t> sNextUniqueId{1};
-    const uint64_t uniqueId = sNextUniqueId++;
-    GFXSTREAM_DEBUG("Creating VirtioGpuProcessPipe:%" PRIu64, uniqueId);
+    GFXSTREAM_DEBUG("Creating VirtioGpuProcessPipe for context:%" PRIu32, id);
 
     // NOTE: historically, the process pipe would have done a
     //
     //   renderer->onGuestGraphicsProcessCreate(uniqueId);
     //
-    // but virtio-gpu uses VirtioGpuContext to manage process resources.
+    // but virtio-gpu uses VirtioGpuContext to manage process resources. The
+    // guest still expects the GLProcessPipe handshake, so return an invalid
+    // PUID and keep the context id as the process identifier.
 
-    return std::unique_ptr<VirtioGpuPipeImpl>(new VirtioGpuProcessPipe(uniqueId));
+    return std::unique_ptr<VirtioGpuPipeImpl>(new VirtioGpuProcessPipe(kInvalidPuid));
 }
 
 VirtioGpuProcessPipe::VirtioGpuProcessPipe(uint64_t id) : mUniqueId(id) {}
@@ -194,6 +206,14 @@ VirtioGpuPipe::VirtioGpuPipe(RendererPtr renderer, VirtioGpuContextId id)
 int VirtioGpuPipe::TransferToHost(const char* data, size_t dataSize) {
     // The first data sent to the host is a string declaring the type of pipe requested.
     if (mUnderlyingPipe == nullptr) {
+        CreateUnderlyingPipe(data, dataSize);
+        return 0;
+    }
+
+    if (mUnderlyingPipe->CanBeReplacedByServiceRequest() && IsPipeTypeMessage(data, dataSize)) {
+        GFXSTREAM_DEBUG("Replacing completed VirtioGpuProcessPipe on context:%" PRIu32
+                        " with service request '%.*s'",
+                        mContextId, static_cast<int>(dataSize), data);
         CreateUnderlyingPipe(data, dataSize);
         return 0;
     }

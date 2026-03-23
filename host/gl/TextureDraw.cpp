@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <string>
 
+#include "GLESVersionDetector.h"
 #include "OpenGLESDispatch/DispatchTables.h"
 #include "gfxstream/common/logging.h"
 
@@ -78,7 +79,7 @@ GLuint createShader(GLint shaderType, const char* shaderText) {
 //  for gl_Position/varyings or just doesn't like trigonometric functions in
 //  shader; anyway the new code has hardcoded texture coordinate mapping for
 //  different rotation angles and works in both native OpenGL and SwiftShader.
-const char kVertexShaderSource[] =
+const char kVertexShaderSourceEs[] =
     "attribute vec4 position;\n"
     "attribute vec2 inCoord;\n"
     "varying vec2 outCoord;\n"
@@ -94,7 +95,7 @@ const char kVertexShaderSource[] =
     "}\n";
 
 // Similarly, just interpolate texture coordinates.
-const char kFragmentShaderSource[] =
+const char kFragmentShaderSourceEs[] =
     "#define kComposeModeDevice 2\n"
     "precision mediump float;\n"
     "varying lowp vec2 outCoord;\n"
@@ -114,6 +115,50 @@ const char kFragmentShaderSource[] =
     "  outColor = colorTransform * outColor;\n"
     "  gl_FragColor = outColor;\n"
     "}\n";
+
+const char kVertexShaderSourceCore[] = R"(#version 330 core
+layout(location = 0) in vec4 position;
+layout(location = 1) in vec2 inCoord;
+out vec2 outCoord;
+uniform vec2 translation;
+uniform vec2 scale;
+uniform vec2 coordTranslation;
+uniform vec2 coordScale;
+void main(void) {
+  gl_Position.xy = position.xy * scale.xy - translation.xy;
+  gl_Position.zw = position.zw;
+  outCoord = inCoord * coordScale + coordTranslation;
+}
+)";
+
+const char kFragmentShaderSourceCore[] = R"(#version 330 core
+#define kComposeModeDevice 2
+in vec2 outCoord;
+uniform sampler2D tex;
+uniform float alpha;
+uniform int composeMode;
+uniform vec4 color;
+uniform mat4 colorTransform;
+layout(location = 0) out vec4 fragColor;
+void main(void) {
+  vec4 outColor;
+  if (composeMode == kComposeModeDevice) {
+    outColor = alpha * texture(tex, outCoord);
+  } else {
+    outColor = alpha * color;
+  }
+  outColor = colorTransform * outColor;
+  fragColor = outColor;
+}
+)";
+
+const char* getVertexShaderSource(bool useCoreProfile) {
+    return useCoreProfile ? kVertexShaderSourceCore : kVertexShaderSourceEs;
+}
+
+const char* getFragmentShaderSource(bool useCoreProfile) {
+    return useCoreProfile ? kFragmentShaderSourceCore : kFragmentShaderSourceEs;
+}
 
 static const GLfloat kIdentityMatrix[16] = {
     1.0f, 0.0f, 0.0f, 0.0f,
@@ -198,16 +243,22 @@ TextureDraw::TextureDraw()
       mScaleSlot(-1),
       mTextureSlot(-1),
       mTranslationSlot(-1),
+      mVertexBuffer(0),
+      mIndexBuffer(0),
+      mVertexArray(0),
       mColorTransform(-1),
+      mUseCoreProfile(shouldEnableCoreProfile()),
       mMaskTexture(0),
+      mMaskWidth(0),
+      mMaskHeight(0),
       mMaskTextureWidth(0),
       mMaskTextureHeight(0),
       mHaveNewMask(false),
       mMaskIsValid(false),
       mShouldReallocateTexture(true) {
     // Create shaders and program.
-    mVertexShader = createShader(GL_VERTEX_SHADER, kVertexShaderSource);
-    mFragmentShader = createShader(GL_FRAGMENT_SHADER, kFragmentShaderSource);
+    mVertexShader = createShader(GL_VERTEX_SHADER, getVertexShaderSource(mUseCoreProfile));
+    mFragmentShader = createShader(GL_FRAGMENT_SHADER, getFragmentShaderSource(mUseCoreProfile));
 
     mProgram = s_gles2.glCreateProgram();
     s_gles2.glAttachShader(mProgram, mVertexShader);
@@ -224,6 +275,11 @@ TextureDraw::TextureDraw()
         s_gles2.glDeleteProgram(mProgram);
         mProgram = 0;
         return;
+    }
+
+    if (mUseCoreProfile) {
+        s_gles2.glGenVertexArrays(1, &mVertexArray);
+        s_gles2.glBindVertexArray(mVertexArray);
     }
 
     s_gles2.glUseProgram(mProgram);
@@ -278,6 +334,9 @@ TextureDraw::TextureDraw()
     s_gles2.glDisableVertexAttribArray(mInCoordSlot);
     s_gles2.glBindBuffer(GL_ARRAY_BUFFER, 0);
     s_gles2.glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    if (mUseCoreProfile) {
+        s_gles2.glBindVertexArray(0);
+    }
 
     // Create a texture handle for use with an overlay mask
     s_gles2.glGenTextures(1, &mMaskTexture);
@@ -294,6 +353,9 @@ bool TextureDraw::drawImpl(GLuint texture, float rotation,
     // TODO(digit): Save previous program state.
 
     s_gles2.glUseProgram(mProgram);
+    if (mUseCoreProfile) {
+        s_gles2.glBindVertexArray(mVertexArray);
+    }
 
     s_gles2.glEnable(GL_BLEND);
     s_gles2.glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
@@ -485,11 +547,17 @@ bool TextureDraw::drawImpl(GLuint texture, float rotation,
     s_gles2.glDisableVertexAttribArray(mInCoordSlot);
     s_gles2.glBindBuffer(GL_ARRAY_BUFFER, 0);
     s_gles2.glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    if (mUseCoreProfile) {
+        s_gles2.glBindVertexArray(0);
+    }
 
     return true;
 }
 
 TextureDraw::~TextureDraw() {
+    if (mVertexArray) {
+        s_gles2.glDeleteVertexArrays(1, &mVertexArray);
+    }
     s_gles2.glDeleteBuffers(1, &mIndexBuffer);
     s_gles2.glDeleteBuffers(1, &mVertexBuffer);
 
@@ -501,6 +569,9 @@ TextureDraw::~TextureDraw() {
     }
     if (mMaskTexture) {
         s_gles2.glDeleteTextures(1, &mMaskTexture);
+    }
+    if (mProgram) {
+        s_gles2.glDeleteProgram(mProgram);
     }
 }
 
@@ -530,6 +601,9 @@ void TextureDraw::preDrawLayer() {
         return;
     }
     s_gles2.glUseProgram(mProgram);
+    if (mUseCoreProfile) {
+        s_gles2.glBindVertexArray(mVertexArray);
+    }
 #ifdef DEBUG_TEXTURE_DRAW
     GLenum err = s_gles2.glGetError();
     if (err != GL_NO_ERROR) {

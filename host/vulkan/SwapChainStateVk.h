@@ -55,7 +55,8 @@ class SwapChainStateVk {
                                               uint32_t queueFamilyIndex);
     static std::optional<SwapchainCreateInfoWrapper> createSwapChainCi(
         const VulkanDispatch&, VkSurfaceKHR, VkPhysicalDevice, uint32_t width, uint32_t height,
-        const std::unordered_set<uint32_t>& queueFamilyIndices);
+        const std::unordered_set<uint32_t>& queueFamilyIndices,
+        VkSwapchainKHR oldSwapchain = VK_NULL_HANDLE);
 
     SwapChainStateVk() = delete;
     SwapChainStateVk(const SwapChainStateVk&) = delete;

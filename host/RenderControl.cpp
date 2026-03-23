@@ -16,6 +16,7 @@
 
 #include "RenderControl.h"
 
+#include <cstdlib>
 #include <inttypes.h>
 #include <string.h>
 
@@ -33,6 +34,7 @@
 #include "SyncThread.h"
 #include "gfxstream/Tracing.h"
 #include "gfxstream/common/logging.h"
+#include "gfxstream/host/address_space_device.h"
 #include "gfxstream/host/AstcCpuDecompressor.h"
 #include "gfxstream/host/ChecksumCalculatorThreadInfo.h"
 #include "gfxstream/host/Tracing.h"
@@ -78,6 +80,19 @@ using gl::RenderThreadInfoGl;
 #else
 #define EGLSYNC_DPRINT(...)
 #endif
+
+namespace {
+
+bool IsPresentTraceEnabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char* env = std::getenv("QEMU_RUTABAGA_TRACE_PRESENT");
+        enabled = (env && env[0] && !(env[0] == '0' && env[1] == '\0')) ? 1 : 0;
+    }
+    return enabled;
+}
+
+}  // namespace
 
 // GrallocSync is a class that helps to reflect the behavior of
 // gralloc_lock/gralloc_unlock on the guest.
@@ -350,6 +365,10 @@ static bool shouldEnableVulkanAsyncQsri(const gfxstream::host::FeatureSet& featu
           features.VirtioGpuFenceContexts.enabled));
 }
 
+static bool shouldEnableReadColorBufferDma() {
+    return gfxstream::host::gfxstream_address_space_get_hw_funcs() != nullptr;
+}
+
 static bool shouldEnableVsyncGatedSyncFences(const gfxstream::host::FeatureSet& features) {
     return shouldEnableAsyncSwap(features);
 }
@@ -465,7 +484,7 @@ static EGLint rcGetGLString(EGLenum name, void* buffer, EGLint bufferSize) {
     bool vulkanBatchedDescriptorSetUpdate = shouldEnableBatchedDescriptorSetUpdate(features);
     bool syncBufferDataEnabled = true;
     bool vulkanAsyncQsri = shouldEnableVulkanAsyncQsri(features);
-    bool readColorBufferDma = directMemEnabled && hasSharedSlotsHostMemoryAllocatorEnabled;
+    bool readColorBufferDma = shouldEnableReadColorBufferDma();
     bool hwcMultiConfigs = features.HwcMultiConfigs.enabled;
     bool hwcColorTransform = true;  // To ensure old host emulators won't advertise the support
 
@@ -939,6 +958,9 @@ static void rcFBPost(uint32_t colorBuffer)
         return;
     }
 
+    if (IsPresentTraceEnabled()) {
+        GFXSTREAM_INFO("PRESENT rcFBPost colorBuffer=%u", colorBuffer);
+    }
     fb->post(colorBuffer);
 }
 
@@ -1299,7 +1321,12 @@ static int rcSetDisplayColorBuffer(uint32_t displayId, uint32_t colorBuffer) {
         return -1;
     }
 
-    return fb->setDisplayColorBuffer(displayId, colorBuffer);
+    int ret = fb->setDisplayColorBuffer(displayId, colorBuffer);
+    if (IsPresentTraceEnabled()) {
+        GFXSTREAM_INFO("PRESENT rcSetDisplayColorBuffer display=%u colorBuffer=%u ret=%d",
+                       displayId, colorBuffer, ret);
+    }
+    return ret;
 }
 
 static int rcGetDisplayColorBuffer(uint32_t displayId, uint32_t* colorBuffer) {
@@ -1600,9 +1627,27 @@ static void rcSetProcessMetadata(char* key, RenderControlByte* valuePtr, uint32_
     }
 }
 
+static bool isAsgIoTraceEnabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char* env = std::getenv("QEMU_RUTABAGA_TRACE_ASG_IO");
+        enabled = (env && env[0] && !(env[0] == '0' && env[1] == '\0')) ? 1 : 0;
+    }
+    return enabled;
+}
+
 static int rcGetHostExtensionsString(uint32_t bufferSize, void* buffer) {
     // TODO(b/389646068): split off host extensions from GL extensions.
-    return rcGetGLString(GL_EXTENSIONS, buffer, bufferSize);
+    const int result = rcGetGLString(GL_EXTENSIONS, buffer, bufferSize);
+    if (isAsgIoTraceEnabled()) {
+        RenderThreadInfo* tInfo = RenderThreadInfo::get();
+        const char* processName =
+            (tInfo && tInfo->m_processName) ? tInfo->m_processName->c_str() : "<unknown>";
+        GFXSTREAM_INFO(
+            "ASG-IO rcGetHostExtensionsString process=%s bufferSize=%u result=%d",
+            processName, bufferSize, result);
+    }
+    return result;
 }
 
 void initRenderControlContext(renderControl_decoder_context_t *dec)

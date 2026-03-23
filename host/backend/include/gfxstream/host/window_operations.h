@@ -20,5 +20,6 @@ namespace gfxstream {
 
 void set_gfxstream_window_operations(const gfxstream_window_ops& ops);
 const gfxstream_window_ops& get_gfxstream_window_operations();
+bool gfxstream_window_has_ui_thread_ops();
 
 }  // namespace gfxstream

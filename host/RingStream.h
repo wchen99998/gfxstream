@@ -15,6 +15,7 @@
 #pragma once
 
 #include <functional>
+#include <string>
 #include <vector>
 
 #include "gfxstream/host/address_space_graphics_types.h"
@@ -82,6 +83,9 @@ class RingStream final : public IOStream {
     bool mShouldExit = false;
     bool mShouldExitForSnapshot = false;
     bool mInSnapshotOperation = false;
+    std::string mContextName;
+    bool mTraceAsgIo = false;
+    uint32_t mTraceBudget = 0;
 };
 
 }  // namespace gfxstream

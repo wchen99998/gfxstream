@@ -84,7 +84,9 @@ public:
     GLint mTranslationSlot;
     GLuint mVertexBuffer;
     GLuint mIndexBuffer;
+    GLuint mVertexArray;
     GLuint mColorTransform;
+    bool mUseCoreProfile;
 
     gfxstream::base::Lock mMaskLock;
     GLuint mMaskTexture;

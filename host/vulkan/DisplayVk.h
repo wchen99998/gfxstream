@@ -58,6 +58,7 @@ class DisplayVk : public gfxstream::Display {
     void unbindFromSurfaceImpl() override;
 
    private:
+    class PostResource;
     void destroySwapchain();
     bool recreateSwapchain();
 

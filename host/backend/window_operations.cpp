@@ -45,4 +45,11 @@ const gfxstream_window_ops& get_gfxstream_window_operations() {
     return sGfxstreamWindowOps;
 }
 
+bool gfxstream_window_has_ui_thread_ops() {
+    return sGfxstreamWindowOps.is_current_thread_ui_thread !=
+               DefaultGfxstreamWindowIsCurrentThreadUiThread &&
+           sGfxstreamWindowOps.run_on_ui_thread !=
+               DefaultGfxstreamWindowRunOnUiThread;
+}
+
 }  // namespace gfxstream

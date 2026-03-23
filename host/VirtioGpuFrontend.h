@@ -177,6 +177,12 @@ class VirtioGpuFrontend {
     int restoreAsg(const char* directory);
 #endif  // GFXSTREAM_BUILD_WITH_SNAPSHOT_FRONTEND_SUPPORT
 
+    int showNativeSurface(uint32_t displayId,
+                          const NativeSurface& surface,
+                          int32_t framebufferWidth,
+                          int32_t framebufferHeight,
+                          bool deleteExisting);
+
     RendererPtr mRenderer;
     void* mCookie = nullptr;
     gfxstream::host::FeatureSet mFeatures;

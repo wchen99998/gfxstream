@@ -87,6 +87,9 @@ if host_machine.system() == 'darwin'
   cocoa_dep = dependency('appleframeworks', modules: 'Cocoa', required: true)
   corefoundation_dep = dependency('appleframeworks', modules: 'CoreFoundation', required: true)
   iokit_dep = dependency('appleframeworks', modules: 'IOKit', required: true)
+  opengl_dep = dependency('appleframeworks', modules: 'OpenGL', required: true)
+  quartzcore_dep = dependency('appleframeworks', modules: 'QuartzCore', required: true)
+  iosurface_dep = dependency('appleframeworks', modules: 'IOSurface', required: true)
 endif
 
 if log_level == 'error'

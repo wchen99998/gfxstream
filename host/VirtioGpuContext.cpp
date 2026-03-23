@@ -126,9 +126,17 @@ int VirtioGpuContext::CreateAddressSpaceGraphicsInstance(
         .contextName = asgName.c_str(),
         .contextNameSize = static_cast<uint32_t>(asgName.size()),
     };
+    GFXSTREAM_DEBUG("ASG-TRACE CONTEXT_CREATE ctx=%u resource=%u handle=%u "
+                    "resourceHva=%p size=0x%llx",
+                    mId, resourceId, asgId, resourceHva,
+                    static_cast<unsigned long long>(resourceHvaSize));
+
     asgOps.create_instance(createInfo);
 
     mAddressSpaceHandles[resourceId] = asgId;
+    GFXSTREAM_DEBUG("ASG instance created ctx=%u resource=%u handle=%u hva=%p size=0x%llx",
+                    mId, resourceId, asgId, resourceHva,
+                    static_cast<unsigned long long>(resourceHvaSize));
     return 0;
 }
 
@@ -161,6 +169,8 @@ int VirtioGpuContext::PingAddressSpaceGraphicsInstance(
     AddressSpaceDevicePingInfo ping = {
         .metadata = ASG_NOTIFY_AVAILABLE,
     };
+    GFXSTREAM_DEBUG("ASG instance ping ctx=%u resource=%u handle=%u",
+                    mId, resourceId, asgId);
     asgOps.ping_at_hva(asgId, &ping);
 
     return 0;

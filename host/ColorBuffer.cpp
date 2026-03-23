@@ -39,6 +39,19 @@ bool shouldAttemptExternalMemorySharing(FrameworkFormat format) {
     return format == FrameworkFormat::FRAMEWORK_FORMAT_GL_COMPATIBLE;
 }
 
+bool shouldPreferVkReadback(GLenum pixelsFormat, GLenum pixelsType) {
+    if (pixelsType != GL_UNSIGNED_BYTE) {
+        return false;
+    }
+
+    switch (pixelsFormat) {
+        case GL_RGBA:
+            return true;
+        default:
+            return false;
+    }
+}
+
 }  // namespace
 
 class ColorBuffer::Impl : public LazySnapshotObj<ColorBuffer::Impl> {
@@ -262,6 +275,14 @@ void ColorBuffer::Impl::readToBytes(int x, int y, int width, int height, GLenum 
                                     GLenum pixelsType, void* outPixels, uint64_t outPixelsSize) {
     touch();
 
+    if (mColorBufferVk && shouldPreferVkReadback(pixelsFormat, pixelsType)) {
+        if (!invalidateForVk()) {
+            GFXSTREAM_FATAL("Failed to sync ColorBuffer:%d for Vulkan readback.", mHandle);
+        }
+        mColorBufferVk->readToBytes(x, y, width, height, outPixels, outPixelsSize);
+        return;
+    }
+
 #if GFXSTREAM_ENABLE_HOST_GLES
     if (mColorBufferGl) {
         mColorBufferGl->readPixels(x, y, width, height, pixelsFormat, pixelsType, outPixels);
@@ -291,6 +312,9 @@ void ColorBuffer::Impl::readToBytesScaled(int pixelsWidth, int pixelsHeight, GLe
 #endif
 
     if (mColorBufferVk) {
+        if (!invalidateForVk()) {
+            GFXSTREAM_FATAL("Failed to sync ColorBuffer:%d for scaled Vulkan readback.", mHandle);
+        }
         // TODO(b/389646068): support snipping and calculate the buffer size for any format here
         if (rect.pos.x != 0 || rect.pos.y != 0 ||
             (rect.size.w != 0 && rect.size.w != pixelsWidth) ||
@@ -301,8 +325,7 @@ void ColorBuffer::Impl::readToBytesScaled(int pixelsWidth, int pixelsHeight, GLe
                 rect.pos.x, rect.pos.y, rect.size.w, rect.size.h);
             return;
         }
-        if ((pixelsFormat != GL_RGBA && pixelsFormat != GL_RGB) ||
-            (pixelsType != GL_UNSIGNED_BYTE)) {
+        if (!shouldPreferVkReadback(pixelsFormat, pixelsType)) {
             GFXSTREAM_ERROR(
                 "Readback is not supported for Vulkan ColorBuffer with format: 0x%x type: %d. ",
                 pixelsFormat, pixelsType);
@@ -329,6 +352,9 @@ void ColorBuffer::Impl::readYuvToBytes(int x, int y, int width, int height, void
 #endif
 
     if (mColorBufferVk) {
+        if (!invalidateForVk()) {
+            GFXSTREAM_FATAL("Failed to sync ColorBuffer:%d for Vulkan YUV readback.", mHandle);
+        }
         mColorBufferVk->readToBytes(x, y, width, height, outPixels, outPixelsSize);
         return;
     }

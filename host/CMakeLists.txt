@@ -18,7 +18,8 @@ add_library(
 target_include_directories(
         gfxstream_backend_headers
         INTERFACE
-        include)
+        include
+        backend/include)
 
 add_subdirectory(address_space)
 add_subdirectory(backend)
@@ -85,6 +86,7 @@ set(stream-server-core-sources
     VirtioGpuContext.cpp
     VirtioGpuFrontend.cpp
     VirtioGpuPipe.cpp
+    goldfish_pipe/GoldfishPipeService.cpp
     VirtioGpuResource.cpp
     VirtioGpuRingBlob.cpp
     VirtioGpuTimelines.cpp

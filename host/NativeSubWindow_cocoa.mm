@@ -83,15 +83,18 @@ EGLNativeWindowType createSubWindow(FBNativeWindowType p_window,
     bool useMetalView = false;
     const char* angle_default_platform = getenv("ANGLE_DEFAULT_PLATFORM");
     const char* emuVulkanICD = getenv("ANDROID_EMU_VK_ICD");
-    if (angle_default_platform && emuVulkanICD) {
-        if (0 == strcmp("metal", angle_default_platform)) {
-            // legacy behavior
-            useMetalView = true;
-        } else if ((0 == strcmp("swiftshader", emuVulkanICD)) ||
-                   (0 == strcmp("lavapipe", emuVulkanICD))) {
-            // Do not enable metal views when using software rendering
+    if (angle_default_platform && 0 == strcmp("metal", angle_default_platform)) {
+        // Legacy behavior: ANGLE on Metal requires a Metal-backed view.
+        useMetalView = true;
+    }
+    if (emuVulkanICD) {
+        if ((0 == strcmp("swiftshader", emuVulkanICD)) ||
+            (0 == strcmp("lavapipe", emuVulkanICD))) {
+            // Do not enable metal views when using software rendering.
             useMetalView = false;
         } else {
+            // Hardware Vulkan swapchains on macOS require a CAMetalLayer even when
+            // ANGLE_DEFAULT_PLATFORM is unset.
             useMetalView = true;
         }
     }
@@ -156,17 +159,22 @@ int moveSubWindow(FBNativeWindowType p_parent_window,
 
     __block int result = 0;
     dispatch_main_safe(^{
-        /* The view must be removed from the hierarchy to be properly resized */
-        [glView removeFromSuperview];
-
         /* (x,y) assume an upper-left origin, but Cocoa uses a lower-left origin */
         NSRect content_rect = [win contentRectForFrameRect:[win frame]];
         int cocoa_y = (int)content_rect.size.height - (y + height);
         NSRect newFrame = NSMakeRect(x, cocoa_y, width, height);
-        [glView setFrame:newFrame];
 
-        /* Re-add the sub-window to the view hierarchy */
-        [[win contentView] addSubview:glView];
+        if ([glView.layer isKindOfClass:[CAMetalLayer class]]) {
+            // Keep Metal-backed views attached during live resize so the old
+            // frame remains visible while gfxstream recreates the swapchain.
+            [glView setFrame:newFrame];
+            [glView.layer setContentsScale:dpr];
+        } else {
+            /* The legacy non-Metal path still expects a detach/reattach cycle. */
+            [glView removeFromSuperview];
+            [glView setFrame:newFrame];
+            [[win contentView] addSubview:glView];
+        }
         result = 1;
     });
     return result;

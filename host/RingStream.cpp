@@ -15,6 +15,7 @@
 #include "RingStream.h"
 
 #include <assert.h>
+#include <cstdlib>
 #include <memory.h>
 
 #include "gfxstream/host/dma_device.h"
@@ -61,13 +62,57 @@ void LoadRingConfig(Stream* stream, struct asg_ring_config* config) {
     config->in_error = stream->getBe32();
 }
 
+bool IsAsgIoTraceEnabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char* env = std::getenv("QEMU_RUTABAGA_TRACE_ASG_IO");
+        enabled = (env && env[0] && !(env[0] == '0' && env[1] == '\0')) ? 1 : 0;
+    }
+    return enabled;
+}
+
+void LogAsgIoPacket(const char* direction,
+                    const std::string& contextName,
+                    const void* data,
+                    size_t size,
+                    const struct asg_ring_config* config,
+                    const struct ring_buffer* ring) {
+    uint32_t dword0 = 0;
+    uint32_t dword1 = 0;
+    if (size >= sizeof(dword0)) {
+        memcpy(&dword0, data, sizeof(dword0));
+    }
+    if (size >= sizeof(dword0) + sizeof(dword1)) {
+        memcpy(&dword1, static_cast<const char*>(data) + sizeof(dword0), sizeof(dword1));
+    }
+
+    GFXSTREAM_INFO(
+        "ASG-IO %s ctx=%s size=0x%zx d0=0x%x d1=0x%x hostConsumed=0x%x guestWrite=0x%x "
+        "mode=%u transfer=0x%x ringW=0x%x ringR=0x%x state=%u",
+        direction,
+        contextName.empty() ? "<unnamed>" : contextName.c_str(),
+        size,
+        dword0,
+        dword1,
+        config->host_consumed_pos,
+        config->guest_write_pos,
+        config->transfer_mode,
+        config->transfer_size,
+        ring->write_pos,
+        ring->read_pos,
+        ring->state);
+}
+
 }  // namespace
 
 RingStream::RingStream(const AsgConsumerCreateInfo& info, size_t bufsize) :
     IOStream(bufsize),
     mContext(CreateContext(info)),
     mSavedRingConfig(*mContext.ring_config),
-    mCallbacks(info.callbacks) {}
+    mCallbacks(info.callbacks),
+    mContextName(info.virtioGpuContextName ? *info.virtioGpuContextName : ""),
+    mTraceAsgIo(IsAsgIoTraceEnabled()),
+    mTraceBudget(mTraceAsgIo ? 16 : 0) {}
 
 RingStream::~RingStream() = default;
 
@@ -85,6 +130,12 @@ void* RingStream::allocBuffer(size_t minSize) {
 int RingStream::commitBuffer(size_t size) {
     size_t sent = 0;
     auto data = mWriteBuffer.data();
+
+    if (mTraceBudget && size) {
+        LogAsgIoPacket("host->guest", mContextName, data, size, mContext.ring_config,
+                       mContext.from_host_large_xfer.ring);
+        --mTraceBudget;
+    }
 
     size_t iters = 0;
     size_t backedOffIters = 0;
@@ -309,6 +360,11 @@ void RingStream::type1Read(
             return;
         }
         const char* src = mContext.buffer + xfersPtr[i].offset;
+        if (mTraceBudget) {
+            LogAsgIoPacket("guest->host", mContextName, src, xfersPtr[i].size, mContext.ring_config,
+                           mContext.to_host);
+            --mTraceBudget;
+        }
         memcpy(*current, src, xfersPtr[i].size);
         ring_buffer_advance_read(
                 mContext.to_host, sizeof(struct asg_type1_xfer), 1);

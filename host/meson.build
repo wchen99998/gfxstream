@@ -79,6 +79,7 @@ files_lib_gfxstream_backend = files(
   'RenderWindow.cpp',
   'RingStream.cpp',
   'SyncThread.cpp',
+  'goldfish_pipe/GoldfishPipeService.cpp',
   'virtio-gpu-gfxstream-renderer.cpp',
   'VirtioGpuContext.cpp',
   'VirtioGpuFrontend.cpp',
@@ -102,6 +103,7 @@ endif
 
 if use_gles
   subdir('gl')
+  subdir('renderControl_dec')
 
   files_lib_gfxstream_backend += files('PostWorkerGl.cpp')
   files_lib_gfxstream_backend += files('RenderControl.cpp')
@@ -115,6 +117,7 @@ if use_gles
   ]
   link_gfxstream_backend += [
     lib_gl_server,
+    lib_composer,
   ]
 endif
 
@@ -125,7 +128,7 @@ if use_vulkan
   link_gfxstream_backend += lib_vulkan_server
 endif
 
-if use_composer
+if use_composer and not use_gles
   subdir('renderControl_dec')
   link_gfxstream_backend += lib_composer
 endif
@@ -183,6 +186,13 @@ if host_machine.system() == 'darwin'
     corefoundation_dep,
     iokit_dep,
   ]
+  if use_gles
+    deps_gfxstream_backend += [
+      opengl_dep,
+      quartzcore_dep,
+      iosurface_dep,
+    ]
+  endif
 endif
 
 gfxstream_backend = library(

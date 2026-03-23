@@ -29,6 +29,8 @@ constexpr const int kAsgDrawFlushInterval = 10000;
 
 int gfxstream_address_space_save_memory_state(gfxstream::Stream* stream);
 int gfxstream_address_space_load_memory_state(gfxstream::Stream* stream);
+const AddressSpaceHwFuncs* gfxstream_address_space_set_hw_funcs(const AddressSpaceHwFuncs* hwFuncs);
+const AddressSpaceHwFuncs* gfxstream_address_space_get_hw_funcs();
 
 // Resources which can not be directly reloaded by ASG.
 struct AddressSpaceDeviceLoadResources {
