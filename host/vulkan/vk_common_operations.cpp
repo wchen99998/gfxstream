@@ -13,9 +13,11 @@
 // limitations under the License.
 #include "vk_common_operations.h"
 
+#include <chrono>
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
+#include <thread>
 #include <vulkan/vk_enum_string_helper.h>
 
 #include <glm/gtc/type_ptr.hpp>
@@ -38,6 +40,7 @@
 #include "gfxstream/system/System.h"
 #include "render-utils/Renderer.h"
 #include "borrowed_image_vk.h"
+#include "display_vk.h"
 #include "vk_decoder_global_state.h"
 #include "vk_emulated_physical_device_memory.h"
 #include "vk_format_utils.h"
@@ -62,6 +65,8 @@
 namespace gfxstream {
 namespace host {
 namespace vk {
+const char* displayLeaseStateToString(VkEmulation::DisplayLeaseState state);
+
 namespace {
 
 using gfxstream::base::AutoLock;
@@ -1635,7 +1640,8 @@ void VkEmulation::initFeatures(Features features) {
         }
         mDisplayVk = std::make_unique<DisplayVk>(*mIvk, mPhysicalDevice, mDevice,
                                                  mCompositorVk.get(), mQueueFamilyIndex, mQueue,
-                                                 mQueueLock, mQueueFamilyIndex, mQueue, mQueueLock);
+                                                 mQueueLock, mQueueFamilyIndex, mQueue, mQueueLock,
+                                                 this);
     }
 
     auto representativeInfo = findRepresentativeColorBufferMemoryTypeIndexLocked();
@@ -1659,11 +1665,21 @@ void VkEmulation::initFeatures(Features features) {
 }
 
 VkEmulation::~VkEmulation() {
-    std::lock_guard<std::mutex> lock(mMutex);
+    std::unique_ptr<DisplayVk> displayVk;
+    std::unique_ptr<CompositorVk> compositorVk;
+    std::unique_ptr<UdmabufCreator> udmabufCreator;
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        displayVk = std::move(mDisplayVk);
+        compositorVk = std::move(mCompositorVk);
+        udmabufCreator = std::move(mUdmabufCreator);
+    }
 
-    mDisplayVk.reset();
-    mCompositorVk.reset();
-    mUdmabufCreator.reset();
+    displayVk.reset();
+    compositorVk.reset();
+    udmabufCreator.reset();
+
+    std::lock_guard<std::mutex> lock(mMutex);
 
     mYcbcrSamplerPool.destroy();
 
@@ -2988,6 +3004,12 @@ bool VkEmulation::teardownVkColorBufferLocked(uint32_t colorBufferHandle) {
     auto infoPtr = gfxstream::base::find(mColorBuffers, colorBufferHandle);
 
     if (!infoPtr) return false;
+
+    if (infoPtr->displayLeaseState != DisplayLeaseState::kGuestOwned) {
+        GFXSTREAM_FATAL("Destroying ColorBuffer:%u while display lease state is %s.",
+                        colorBufferHandle,
+                        displayLeaseStateToString(infoPtr->displayLeaseState));
+    }
 
     if (infoPtr->initialized) {
         auto& info = *infoPtr;
@@ -4612,16 +4634,20 @@ std::tuple<VkCommandBuffer, VkFence> VkEmulation::allocateQueueTransferCommandBu
 
 const VkImageLayout kGuestUseDefaultImageLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
-void VkEmulation::releaseColorBufferForGuestUse(uint32_t colorBufferHandle) {
-    std::lock_guard<std::mutex> lock(mMutex);
-
-    auto infoPtr = gfxstream::base::find(mColorBuffers, colorBufferHandle);
-    if (!infoPtr) {
-        GFXSTREAM_ERROR("Failed to find ColorBuffer handle %d.",
-                        static_cast<int>(colorBufferHandle));
-        return;
+const char* displayLeaseStateToString(VkEmulation::DisplayLeaseState state) {
+    switch (state) {
+        case VkEmulation::DisplayLeaseState::kGuestOwned:
+            return "guest-owned";
+        case VkEmulation::DisplayLeaseState::kDisplayOwned:
+            return "display-owned";
+        case VkEmulation::DisplayLeaseState::kReleasingToGuest:
+            return "releasing-to-guest";
     }
+    GFXSTREAM_FATAL("Unknown display lease state: %d", static_cast<int>(state));
+}
 
+bool VkEmulation::releaseColorBufferForGuestUseLocked(ColorBufferInfo* infoPtr,
+                                                      uint32_t colorBufferHandle) {
     std::optional<VkImageMemoryBarrier> layoutTransitionBarrier;
     if (infoPtr->currentLayout != kGuestUseDefaultImageLayout) {
         layoutTransitionBarrier = VkImageMemoryBarrier{
@@ -4671,7 +4697,7 @@ void VkEmulation::releaseColorBufferForGuestUse(uint32_t colorBufferHandle) {
     }
 
     if (!layoutTransitionBarrier && !queueTransferBarrier) {
-        return;
+        return false;
     }
 
     auto vk = mDvk;
@@ -4723,6 +4749,371 @@ void VkEmulation::releaseColorBufferForGuestUse(uint32_t colorBufferHandle) {
 
     static constexpr uint64_t ANB_MAX_WAIT_NS = 5ULL * 1000ULL * 1000ULL * 1000ULL;
     VK_CHECK(vk->vkWaitForFences(mDevice, 1, &fence, VK_TRUE, ANB_MAX_WAIT_NS));
+
+    return true;
+}
+
+std::unique_ptr<DisplayLeaseInfoVk> VkEmulation::acquireColorBufferDisplayLeaseLocked(
+    uint32_t colorBufferHandle) {
+    auto infoPtr = gfxstream::base::find(mColorBuffers, colorBufferHandle);
+    if (!infoPtr) {
+        GFXSTREAM_FATAL("Acquiring display lease for unknown ColorBuffer:%u", colorBufferHandle);
+    }
+    auto makeLeaseInfo = [&]() {
+        auto leaseInfo = std::make_unique<DisplayLeaseInfoVk>();
+        leaseInfo->colorBufferHandle = infoPtr->handle;
+        leaseInfo->leaseGeneration = infoPtr->displayLeaseGeneration;
+        leaseInfo->image = infoPtr->image;
+        leaseInfo->imageView = infoPtr->imageView;
+        leaseInfo->imageCreateInfo = infoPtr->imageCreateInfoShallow;
+        leaseInfo->imageFormat = infoPtr->format;
+        leaseInfo->layout = infoPtr->currentLayout;
+        leaseInfo->queueFamilyIndex = infoPtr->currentQueueFamilyIndex;
+        return leaseInfo;
+    };
+
+    if (infoPtr->displayLeaseState == DisplayLeaseState::kReleasingToGuest) {
+        GFXSTREAM_FATAL("Acquiring display lease for ColorBuffer:%u while state is %s.",
+                        colorBufferHandle,
+                        displayLeaseStateToString(infoPtr->displayLeaseState));
+    }
+
+    if (infoPtr->displayLeaseState == DisplayLeaseState::kDisplayOwned) {
+        if (infoPtr->currentQueueFamilyIndex != mQueueFamilyIndex) {
+            GFXSTREAM_FATAL("ColorBuffer:%u display lease queue family is %u, expected %u.",
+                            colorBufferHandle, infoPtr->currentQueueFamilyIndex,
+                            mQueueFamilyIndex);
+        }
+        if (infoPtr->currentLayout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+            GFXSTREAM_FATAL("ColorBuffer:%u display lease layout is %s, expected %s.",
+                            colorBufferHandle, string_VkImageLayout(infoPtr->currentLayout),
+                            string_VkImageLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL));
+        }
+        return makeLeaseInfo();
+    }
+
+    BorrowedImageInfoVk borrowedImageInfo = {};
+    borrowedImageInfo.id = infoPtr->handle;
+    borrowedImageInfo.width = infoPtr->imageCreateInfoShallow.extent.width;
+    borrowedImageInfo.height = infoPtr->imageCreateInfoShallow.extent.height;
+    borrowedImageInfo.image = infoPtr->image;
+    borrowedImageInfo.imageView = infoPtr->imageView;
+    borrowedImageInfo.imageCreateInfo = infoPtr->imageCreateInfoShallow;
+    borrowedImageInfo.imageFormat = infoPtr->format;
+    borrowedImageInfo.preBorrowLayout = infoPtr->currentLayout;
+    borrowedImageInfo.preBorrowQueueFamilyIndex = infoPtr->currentQueueFamilyIndex;
+    borrowedImageInfo.postBorrowLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    borrowedImageInfo.postBorrowQueueFamilyIndex = mQueueFamilyIndex;
+
+    std::vector<VkImageMemoryBarrier> acquireQueueTransferBarriers;
+    std::vector<VkImageMemoryBarrier> acquireLayoutTransitionBarriers;
+    std::vector<VkImageMemoryBarrier> releaseLayoutTransitionBarriers;
+    std::vector<VkImageMemoryBarrier> releaseQueueTransferBarriers;
+    addNeededBarriersToUseBorrowedImage(
+        borrowedImageInfo, mQueueFamilyIndex,
+        /*usedInitialImageLayout=*/VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        /*usedFinalImageLayout=*/VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_ACCESS_TRANSFER_READ_BIT, BorrowedImageLayoutSemantics::kPreserveContents,
+        &acquireQueueTransferBarriers, &acquireLayoutTransitionBarriers,
+        &releaseLayoutTransitionBarriers, &releaseQueueTransferBarriers);
+
+    if (!releaseLayoutTransitionBarriers.empty() || !releaseQueueTransferBarriers.empty()) {
+        GFXSTREAM_FATAL("Display lease acquire for ColorBuffer:%u produced unexpected release barriers.",
+                        colorBufferHandle);
+    }
+
+    if (!acquireQueueTransferBarriers.empty() || !acquireLayoutTransitionBarriers.empty()) {
+        auto vk = mDvk;
+        auto [commandBuffer, fence] = allocateQueueTransferCommandBufferLocked();
+
+        VK_CHECK(vk->vkResetCommandBuffer(commandBuffer, 0));
+        const VkCommandBufferBeginInfo beginInfo = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .pNext = nullptr,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            .pInheritanceInfo = nullptr,
+        };
+        VK_CHECK(vk->vkBeginCommandBuffer(commandBuffer, &beginInfo));
+
+        mDebugUtilsHelper.cmdBeginDebugLabel(
+            commandBuffer, "acquireColorBufferDisplayLease(ColorBuffer:%d)", colorBufferHandle);
+        if (!acquireQueueTransferBarriers.empty()) {
+            vk->vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
+                                     nullptr,
+                                     static_cast<uint32_t>(acquireQueueTransferBarriers.size()),
+                                     acquireQueueTransferBarriers.data());
+        }
+        if (!acquireLayoutTransitionBarriers.empty()) {
+            vk->vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                                     static_cast<uint32_t>(acquireLayoutTransitionBarriers.size()),
+                                     acquireLayoutTransitionBarriers.data());
+        }
+        mDebugUtilsHelper.cmdEndDebugLabel(commandBuffer);
+        VK_CHECK(vk->vkEndCommandBuffer(commandBuffer));
+
+        const VkSubmitInfo submitInfo = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .pNext = nullptr,
+            .waitSemaphoreCount = 0,
+            .pWaitSemaphores = nullptr,
+            .pWaitDstStageMask = nullptr,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &commandBuffer,
+            .signalSemaphoreCount = 0,
+            .pSignalSemaphores = nullptr,
+        };
+        {
+            gfxstream::base::AutoLock queueLock(*mQueueLock);
+            VK_CHECK(vk->vkQueueSubmit(mQueue, 1, &submitInfo, fence));
+        }
+        static constexpr uint64_t kLeaseAcquireWaitNs = 5ULL * 1000ULL * 1000ULL * 1000ULL;
+        VK_CHECK(vk->vkWaitForFences(mDevice, 1, &fence, VK_TRUE, kLeaseAcquireWaitNs));
+    }
+
+    infoPtr->currentLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    infoPtr->currentQueueFamilyIndex = mQueueFamilyIndex;
+    ++infoPtr->displayLeaseGeneration;
+    infoPtr->displayLeaseState = DisplayLeaseState::kDisplayOwned;
+    infoPtr->latestDisplayUseCompletion = CancelableFuture();
+
+    return makeLeaseInfo();
+}
+
+std::unique_ptr<DisplayLeaseInfoVk> VkEmulation::acquireColorBufferDisplayLease(
+    uint32_t colorBufferHandle) {
+    std::lock_guard<std::mutex> lock(mMutex);
+    return acquireColorBufferDisplayLeaseLocked(colorBufferHandle);
+}
+
+std::unique_ptr<DisplayLeaseInfoVk> VkEmulation::acquireColorBufferDisplayLease(
+    uint32_t colorBufferHandle, CancelableFuture completionWaitable,
+    CancelableFuture* previousCompletionWaitable) {
+    if (!previousCompletionWaitable) {
+        GFXSTREAM_FATAL("Missing previous display completion output for ColorBuffer:%u.",
+                        colorBufferHandle);
+    }
+
+    std::lock_guard<std::mutex> lock(mMutex);
+    auto leaseInfo = acquireColorBufferDisplayLeaseLocked(colorBufferHandle);
+    auto infoPtr = gfxstream::base::find(mColorBuffers, colorBufferHandle);
+    if (!infoPtr) {
+        GFXSTREAM_FATAL("Acquired display lease for unknown ColorBuffer:%u.", colorBufferHandle);
+    }
+
+    *previousCompletionWaitable = infoPtr->latestDisplayUseCompletion;
+    infoPtr->latestDisplayUseCompletion = std::move(completionWaitable);
+    return leaseInfo;
+}
+
+bool VkEmulation::isColorBufferDisplayLeaseCurrent(const DisplayLeaseInfoVk& leaseInfo) {
+    std::lock_guard<std::mutex> lock(mMutex);
+
+    auto infoPtr = gfxstream::base::find(mColorBuffers, leaseInfo.colorBufferHandle);
+    if (!infoPtr) {
+        return false;
+    }
+    if (infoPtr->displayLeaseState != DisplayLeaseState::kDisplayOwned) {
+        return false;
+    }
+    if (infoPtr->displayLeaseGeneration != leaseInfo.leaseGeneration) {
+        return false;
+    }
+    if (infoPtr->currentQueueFamilyIndex != mQueueFamilyIndex) {
+        GFXSTREAM_FATAL("ColorBuffer:%u has display lease queue family %u, expected %u.",
+                        leaseInfo.colorBufferHandle, infoPtr->currentQueueFamilyIndex,
+                        mQueueFamilyIndex);
+    }
+    if (infoPtr->currentLayout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+        GFXSTREAM_FATAL("ColorBuffer:%u has display lease layout %s, expected %s.",
+                        leaseInfo.colorBufferHandle,
+                        string_VkImageLayout(infoPtr->currentLayout),
+                        string_VkImageLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL));
+    }
+    return true;
+}
+
+void VkEmulation::setColorBufferLatestDisplayUseCompletion(
+    const DisplayLeaseInfoVk& leaseInfo, CancelableFuture completionWaitable) {
+    std::lock_guard<std::mutex> lock(mMutex);
+
+    auto infoPtr = gfxstream::base::find(mColorBuffers, leaseInfo.colorBufferHandle);
+    if (!infoPtr) {
+        GFXSTREAM_FATAL("Publishing display completion for unknown ColorBuffer:%u",
+                        leaseInfo.colorBufferHandle);
+    }
+    if (infoPtr->displayLeaseState != DisplayLeaseState::kDisplayOwned) {
+        GFXSTREAM_FATAL("Publishing display completion for ColorBuffer:%u while state is %s.",
+                        leaseInfo.colorBufferHandle,
+                        displayLeaseStateToString(infoPtr->displayLeaseState));
+    }
+    if (infoPtr->displayLeaseGeneration != leaseInfo.leaseGeneration) {
+        GFXSTREAM_FATAL("Publishing display completion for stale ColorBuffer:%u display lease.",
+                        leaseInfo.colorBufferHandle);
+    }
+    infoPtr->latestDisplayUseCompletion = std::move(completionWaitable);
+}
+
+VkEmulation::DisplayLeaseReleaseResult VkEmulation::reclaimColorBufferDisplayLeaseInternal(
+    uint32_t colorBufferHandle, std::optional<uint64_t> expectedLeaseGeneration,
+    bool requireActiveLease, bool waitForCompletion) {
+    CancelableFuture latestDisplayUseCompletion;
+    bool mustWaitForQueueIdle = false;
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto infoPtr = gfxstream::base::find(mColorBuffers, colorBufferHandle);
+        if (!infoPtr) {
+            if (requireActiveLease) {
+                GFXSTREAM_FATAL("Releasing display lease for unknown ColorBuffer:%u",
+                                colorBufferHandle);
+            }
+            return DisplayLeaseReleaseResult::kNotLeased;
+        }
+        if (expectedLeaseGeneration &&
+            infoPtr->displayLeaseGeneration != *expectedLeaseGeneration) {
+            return DisplayLeaseReleaseResult::kNotLeased;
+        }
+        if (infoPtr->displayLeaseState == DisplayLeaseState::kGuestOwned) {
+            if (requireActiveLease) {
+                GFXSTREAM_FATAL("Releasing non-existent display lease for ColorBuffer:%u",
+                                colorBufferHandle);
+            }
+            return DisplayLeaseReleaseResult::kNotLeased;
+        }
+        if (infoPtr->displayLeaseState == DisplayLeaseState::kReleasingToGuest) {
+            return DisplayLeaseReleaseResult::kBusy;
+        }
+        latestDisplayUseCompletion = infoPtr->latestDisplayUseCompletion;
+    }
+
+    if (latestDisplayUseCompletion.valid()) {
+        if (!waitForCompletion &&
+            latestDisplayUseCompletion.wait_for(std::chrono::seconds(0)) !=
+                std::future_status::ready) {
+            return DisplayLeaseReleaseResult::kBusy;
+        }
+        const CancelableFutureStatus completionStatus = latestDisplayUseCompletion.get();
+        if (completionStatus == CancelableFutureStatus::kCanceled) {
+            mustWaitForQueueIdle = true;
+        } else if (completionStatus != CancelableFutureStatus::kSuccess) {
+            GFXSTREAM_FATAL("Unexpected display completion status %d for ColorBuffer:%u.",
+                            static_cast<int>(completionStatus), colorBufferHandle);
+        }
+    }
+
+    if (mustWaitForQueueIdle) {
+        gfxstream::base::AutoLock queueLock(*mQueueLock);
+        VK_CHECK(mDvk->vkQueueWaitIdle(mQueue));
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto infoPtr = gfxstream::base::find(mColorBuffers, colorBufferHandle);
+        if (!infoPtr) {
+            if (requireActiveLease) {
+                GFXSTREAM_FATAL("Display lease vanished for ColorBuffer:%u during guest handoff.",
+                                colorBufferHandle);
+            }
+            return DisplayLeaseReleaseResult::kNotLeased;
+        }
+        if (expectedLeaseGeneration &&
+            infoPtr->displayLeaseGeneration != *expectedLeaseGeneration) {
+            return DisplayLeaseReleaseResult::kNotLeased;
+        }
+        if (infoPtr->displayLeaseState == DisplayLeaseState::kGuestOwned) {
+            if (requireActiveLease) {
+                GFXSTREAM_FATAL(
+                    "Display lease for ColorBuffer:%u was cleared during guest handoff.",
+                    colorBufferHandle);
+            }
+            return DisplayLeaseReleaseResult::kNotLeased;
+        }
+        if (infoPtr->displayLeaseState == DisplayLeaseState::kReleasingToGuest) {
+            return DisplayLeaseReleaseResult::kBusy;
+        }
+
+        infoPtr->displayLeaseState = DisplayLeaseState::kReleasingToGuest;
+        releaseColorBufferForGuestUseLocked(infoPtr, colorBufferHandle);
+        infoPtr->displayLeaseState = DisplayLeaseState::kGuestOwned;
+        infoPtr->latestDisplayUseCompletion = CancelableFuture();
+    }
+
+    return DisplayLeaseReleaseResult::kReleased;
+}
+
+VkEmulation::DisplayLeaseReleaseResult VkEmulation::releaseColorBufferDisplayLease(
+    const DisplayLeaseInfoVk& leaseInfo, bool waitForCompletion) {
+    return reclaimColorBufferDisplayLeaseInternal(
+        leaseInfo.colorBufferHandle, leaseInfo.leaseGeneration,
+        /*requireActiveLease=*/false, waitForCompletion);
+}
+
+void VkEmulation::releaseAllDisplayLeases() {
+    while (true) {
+        std::vector<DisplayLeaseInfoVk> leasedBuffers;
+        bool hasInFlightRelease = false;
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            for (auto& [handle, info] : mColorBuffers) {
+                if (info.displayLeaseState == DisplayLeaseState::kDisplayOwned) {
+                    leasedBuffers.push_back(DisplayLeaseInfoVk{
+                        .colorBufferHandle = handle,
+                        .leaseGeneration = info.displayLeaseGeneration,
+                    });
+                    continue;
+                }
+                if (info.displayLeaseState == DisplayLeaseState::kReleasingToGuest) {
+                    hasInFlightRelease = true;
+                }
+            }
+        }
+        if (leasedBuffers.empty() && !hasInFlightRelease) {
+            return;
+        }
+
+        bool madeProgress = false;
+        for (const auto& leaseInfo : leasedBuffers) {
+            const DisplayLeaseReleaseResult result =
+                releaseColorBufferDisplayLease(leaseInfo, /*waitForCompletion=*/true);
+            if (result != DisplayLeaseReleaseResult::kBusy) {
+                madeProgress = true;
+            }
+        }
+        if (!madeProgress) {
+            std::this_thread::yield();
+        }
+    }
+}
+
+bool VkEmulation::handoffColorBufferDisplayLeaseToGuestIfNeeded(uint32_t colorBufferHandle) {
+    while (true) {
+        const DisplayLeaseReleaseResult result = reclaimColorBufferDisplayLeaseInternal(
+            colorBufferHandle, std::nullopt, /*requireActiveLease=*/false,
+            /*waitForCompletion=*/true);
+        if (result == DisplayLeaseReleaseResult::kReleased) {
+            return true;
+        }
+        if (result == DisplayLeaseReleaseResult::kNotLeased) {
+            return false;
+        }
+        std::this_thread::yield();
+    }
+}
+
+void VkEmulation::releaseColorBufferForGuestUse(uint32_t colorBufferHandle) {
+    if (handoffColorBufferDisplayLeaseToGuestIfNeeded(colorBufferHandle)) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(mMutex);
+    auto infoPtr = gfxstream::base::find(mColorBuffers, colorBufferHandle);
+    if (!infoPtr) {
+        GFXSTREAM_ERROR("Failed to find ColorBuffer handle %d.",
+                        static_cast<int>(colorBufferHandle));
+        return;
+    }
+    releaseColorBufferForGuestUseLocked(infoPtr, colorBufferHandle);
 }
 
 std::unique_ptr<BorrowedImageInfoVk> VkEmulation::borrowColorBufferForComposition(
@@ -4733,6 +5124,21 @@ std::unique_ptr<BorrowedImageInfoVk> VkEmulation::borrowColorBufferForCompositio
     if (!colorBufferInfo) {
         GFXSTREAM_ERROR("Invalid ColorBuffer handle %d.", static_cast<int>(colorBufferHandle));
         return nullptr;
+    }
+    if (colorBufferInfo->displayLeaseState == DisplayLeaseState::kReleasingToGuest) {
+        GFXSTREAM_FATAL("Borrowing ColorBuffer:%u for composition while state is %s.",
+                        colorBufferHandle,
+                        displayLeaseStateToString(colorBufferInfo->displayLeaseState));
+    }
+    if (colorBufferInfo->displayLeaseState == DisplayLeaseState::kDisplayOwned &&
+        !colorBufferIsTarget) {
+        GFXSTREAM_FATAL("Borrowing ColorBuffer:%u as a composition source conflicts with an active display lease.",
+                        colorBufferHandle);
+    }
+    if (colorBufferInfo->displayLeaseState == DisplayLeaseState::kDisplayOwned &&
+        (colorBufferInfo->currentQueueFamilyIndex != mQueueFamilyIndex ||
+         colorBufferInfo->currentLayout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)) {
+        GFXSTREAM_FATAL("ColorBuffer:%u has inconsistent active display lease state.", colorBufferHandle);
     }
 
     auto compositorInfo = std::make_unique<BorrowedImageInfoVk>();
@@ -4760,38 +5166,6 @@ std::unique_ptr<BorrowedImageInfoVk> VkEmulation::borrowColorBufferForCompositio
             compositorInfo->postBorrowLayout = kGuestUseDefaultImageLayout;
         }
     }
-
-    colorBufferInfo->currentLayout = compositorInfo->postBorrowLayout;
-    colorBufferInfo->currentQueueFamilyIndex = compositorInfo->postBorrowQueueFamilyIndex;
-
-    return compositorInfo;
-}
-
-std::unique_ptr<BorrowedImageInfoVk> VkEmulation::borrowColorBufferForDisplay(
-    uint32_t colorBufferHandle) {
-    std::lock_guard<std::mutex> lock(mMutex);
-
-    auto colorBufferInfo = gfxstream::base::find(mColorBuffers, colorBufferHandle);
-    if (!colorBufferInfo) {
-        GFXSTREAM_ERROR("Invalid ColorBuffer handle %d.", static_cast<int>(colorBufferHandle));
-        return nullptr;
-    }
-
-    auto compositorInfo = std::make_unique<BorrowedImageInfoVk>();
-    compositorInfo->id = colorBufferInfo->handle;
-    compositorInfo->width = colorBufferInfo->imageCreateInfoShallow.extent.width;
-    compositorInfo->height = colorBufferInfo->imageCreateInfoShallow.extent.height;
-    compositorInfo->image = colorBufferInfo->image;
-    compositorInfo->imageView = colorBufferInfo->imageView;
-    compositorInfo->imageCreateInfo = colorBufferInfo->imageCreateInfoShallow;
-    compositorInfo->imageFormat = colorBufferInfo->format;
-    compositorInfo->preBorrowLayout = colorBufferInfo->currentLayout;
-    compositorInfo->preBorrowQueueFamilyIndex = mQueueFamilyIndex;
-
-    // Instruct the display to perform the queue transfer release after use so
-    // that the color buffer can be acquired by the guest.
-    compositorInfo->postBorrowQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
-    compositorInfo->postBorrowLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
     colorBufferInfo->currentLayout = compositorInfo->postBorrowLayout;
     colorBufferInfo->currentQueueFamilyIndex = compositorInfo->postBorrowQueueFamilyIndex;

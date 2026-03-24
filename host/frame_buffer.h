@@ -411,7 +411,6 @@ class FrameBuffer : public gfxstream::base::EventNotificationSupport<FrameBuffer
 
     std::unique_ptr<BorrowedImageInfo> borrowColorBufferForComposition(uint32_t colorBufferHandle,
                                                                        bool colorBufferIsTarget);
-    std::unique_ptr<BorrowedImageInfo> borrowColorBufferForDisplay(uint32_t colorBufferHandle);
 
     void logVulkanDeviceLost();
 

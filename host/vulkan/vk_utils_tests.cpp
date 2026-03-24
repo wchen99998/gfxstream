@@ -329,6 +329,74 @@ TEST(BorrowedImageVkTest, PreserveContentsNormalizesUndefinedLayout) {
     EXPECT_EQ(postUseQueueTransferBarriers[0].newLayout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 }
 
+TEST(BorrowedImageVkTest, DisplayLeaseAcquireTransitionsIntoDisplayOwnershipOnce) {
+    BorrowedImageInfoVk borrowedImageInfo = {};
+    borrowedImageInfo.image = reinterpret_cast<VkImage>(0x5678);
+    borrowedImageInfo.preBorrowLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    borrowedImageInfo.preBorrowQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+    borrowedImageInfo.postBorrowLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    borrowedImageInfo.postBorrowQueueFamilyIndex = 5;
+
+    std::vector<VkImageMemoryBarrier> preUseQueueTransferBarriers;
+    std::vector<VkImageMemoryBarrier> preUseLayoutTransitionBarriers;
+    std::vector<VkImageMemoryBarrier> postUseLayoutTransitionBarriers;
+    std::vector<VkImageMemoryBarrier> postUseQueueTransferBarriers;
+    addNeededBarriersToUseBorrowedImage(
+        borrowedImageInfo,
+        /*usedQueueFamilyIndex=*/5,
+        /*usedInitialImageLayout=*/VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        /*usedFinalImageLayout=*/VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_ACCESS_TRANSFER_READ_BIT, BorrowedImageLayoutSemantics::kPreserveContents,
+        &preUseQueueTransferBarriers, &preUseLayoutTransitionBarriers,
+        &postUseLayoutTransitionBarriers, &postUseQueueTransferBarriers);
+
+    ASSERT_THAT(preUseQueueTransferBarriers, SizeIs(1));
+    EXPECT_EQ(preUseQueueTransferBarriers[0].oldLayout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    EXPECT_EQ(preUseQueueTransferBarriers[0].newLayout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+
+    ASSERT_THAT(preUseLayoutTransitionBarriers, SizeIs(1));
+    EXPECT_EQ(preUseLayoutTransitionBarriers[0].oldLayout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    EXPECT_EQ(preUseLayoutTransitionBarriers[0].newLayout,
+              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+    EXPECT_THAT(postUseLayoutTransitionBarriers, IsEmpty());
+    EXPECT_THAT(postUseQueueTransferBarriers, IsEmpty());
+}
+
+TEST(BorrowedImageVkTest, DisplayLeaseReleaseTransitionsBackToGuestOwnership) {
+    BorrowedImageInfoVk borrowedImageInfo = {};
+    borrowedImageInfo.image = reinterpret_cast<VkImage>(0x8765);
+    borrowedImageInfo.preBorrowLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    borrowedImageInfo.preBorrowQueueFamilyIndex = 5;
+    borrowedImageInfo.postBorrowLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    borrowedImageInfo.postBorrowQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+
+    std::vector<VkImageMemoryBarrier> preUseQueueTransferBarriers;
+    std::vector<VkImageMemoryBarrier> preUseLayoutTransitionBarriers;
+    std::vector<VkImageMemoryBarrier> postUseLayoutTransitionBarriers;
+    std::vector<VkImageMemoryBarrier> postUseQueueTransferBarriers;
+    addNeededBarriersToUseBorrowedImage(
+        borrowedImageInfo,
+        /*usedQueueFamilyIndex=*/5,
+        /*usedInitialImageLayout=*/VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        /*usedFinalImageLayout=*/VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_ACCESS_TRANSFER_READ_BIT, BorrowedImageLayoutSemantics::kPreserveContents,
+        &preUseQueueTransferBarriers, &preUseLayoutTransitionBarriers,
+        &postUseLayoutTransitionBarriers, &postUseQueueTransferBarriers);
+
+    EXPECT_THAT(preUseQueueTransferBarriers, IsEmpty());
+    EXPECT_THAT(preUseLayoutTransitionBarriers, IsEmpty());
+
+    ASSERT_THAT(postUseLayoutTransitionBarriers, SizeIs(1));
+    EXPECT_EQ(postUseLayoutTransitionBarriers[0].oldLayout,
+              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    EXPECT_EQ(postUseLayoutTransitionBarriers[0].newLayout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+
+    ASSERT_THAT(postUseQueueTransferBarriers, SizeIs(1));
+    EXPECT_EQ(postUseQueueTransferBarriers[0].oldLayout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    EXPECT_EQ(postUseQueueTransferBarriers[0].newLayout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+}
+
 TEST(BorrowedImageVkTest, MayDiscardContentsKeepsUndefinedTransition) {
     BorrowedImageInfoVk borrowedImageInfo = {};
     borrowedImageInfo.image = reinterpret_cast<VkImage>(0x4321);

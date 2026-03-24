@@ -312,6 +312,7 @@ endfunction()
         vulkan/compositor_vk_unittest.cpp
         vulkan/display_vk_unittest.cpp
         vulkan/swap_chain_state_vk_unittest.cpp
+        vulkan/vk_common_operations_unittest.cpp
         vulkan/vk_decoder_global_state_unittest.cpp
         vulkan/vk_format_utils_unittest.cpp
         vulkan/vk_qsri_timeline_unittest.cpp

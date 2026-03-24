@@ -90,12 +90,28 @@ class DisplayVkTest : public ::testing::Test {
         info->width = texture->m_vkImageCreateInfo.extent.width;
         info->height = texture->m_vkImageCreateInfo.extent.height;
         info->image = texture->m_vkImage;
+        info->imageView = texture->m_vkImageView;
         info->imageCreateInfo = texture->m_vkImageCreateInfo;
+        info->imageFormat = GfxstreamFormat::R8G8B8A8_UNORM;
         info->preBorrowLayout = RenderTexture::k_vkImageLayout;
         info->preBorrowQueueFamilyIndex = m_compositorQueueFamilyIndex;
         info->postBorrowLayout = RenderTexture::k_vkImageLayout;
         info->postBorrowQueueFamilyIndex = m_compositorQueueFamilyIndex;
         return info;
+    }
+
+    DisplayLeaseInfoVk createDisplayLeaseInfo(const std::unique_ptr<const RenderTexture>& texture,
+                                              uint32_t colorBufferHandle) {
+        return DisplayLeaseInfoVk{
+            .colorBufferHandle = colorBufferHandle,
+            .leaseGeneration = 0,
+            .image = texture->m_vkImage,
+            .imageView = texture->m_vkImageView,
+            .imageCreateInfo = texture->m_vkImageCreateInfo,
+            .imageFormat = GfxstreamFormat::R8G8B8A8_UNORM,
+            .layout = RenderTexture::k_vkImageLayout,
+            .queueFamilyIndex = m_compositorQueueFamilyIndex,
+        };
     }
 
     static const VulkanDispatch* k_vk;
@@ -132,6 +148,14 @@ class DisplayVkTest : public ::testing::Test {
             *k_vk, m_vkPhysicalDevice, m_vkDevice, compositorVk, m_compositorQueueFamilyIndex,
             m_compositorVkQueue, m_compositorVkQueueLock, m_swapChainQueueFamilyIndex,
             m_swapChainVkQueue, m_swapChainVkQueueLock);
+    }
+
+    void recreateDisplayWithCompositor() {
+        m_displayVk.reset();
+        m_compositorVk = createCompositor();
+        ASSERT_NE(m_compositorVk, nullptr);
+        createDisplay(m_compositorVk.get());
+        m_displayVk->bindToSurface(m_displaySurface.get());
     }
 
    private:
@@ -376,11 +400,7 @@ TEST_F(DisplayVkTest, PostWithColorTransform) {
 }
 
 TEST_F(DisplayVkTest, ResizeReclaimsImmediateModeResources) {
-    m_displayVk.reset();
-    m_compositorVk = createCompositor();
-    ASSERT_NE(m_compositorVk, nullptr);
-    createDisplay(m_compositorVk.get());
-    m_displayVk->bindToSurface(m_displaySurface.get());
+    recreateDisplayWithCompositor();
 
     constexpr uint32_t textureWidth = 20;
     constexpr uint32_t textureHeight = 40;
@@ -413,6 +433,112 @@ TEST_F(DisplayVkTest, ResizeReclaimsImmediateModeResources) {
     for (auto* resource : resources) {
         m_compositorVk->releaseImmediateModeResources(resource);
     }
+}
+
+TEST_F(DisplayVkTest, LeasePostSkipsSourceBorrowSubmissions) {
+    constexpr uint32_t textureWidth = 20;
+    constexpr uint32_t textureHeight = 40;
+    auto texture = RenderTexture::create(*k_vk, m_vkDevice, m_vkPhysicalDevice, m_compositorVkQueue,
+                                         m_vkCommandPool, textureWidth, textureHeight);
+    ASSERT_NE(texture, nullptr);
+    std::vector<uint32_t> pixels(textureWidth * textureHeight, 0xff0088ff);
+    ASSERT_TRUE(texture->write(pixels));
+
+    const auto leaseInfo = createDisplayLeaseInfo(texture, /*colorBufferHandle=*/1001);
+    for (uint32_t i = 0; i < 5; ++i) {
+        auto postResult = m_displayVk->post(leaseInfo, 0.0f, std::nullopt);
+        ASSERT_TRUE(postResult.success);
+        postResult.postCompletedWaitable.wait();
+    }
+
+    EXPECT_EQ(m_displayVk->getSourceBorrowSubmitCountForTesting(), 0u);
+}
+
+TEST_F(DisplayVkTest, BorrowedPostSkipsAuxiliarySourceBorrowSubmissions) {
+    constexpr uint32_t textureWidth = 20;
+    constexpr uint32_t textureHeight = 40;
+    auto texture = RenderTexture::create(*k_vk, m_vkDevice, m_vkPhysicalDevice, m_compositorVkQueue,
+                                         m_vkCommandPool, textureWidth, textureHeight);
+    ASSERT_NE(texture, nullptr);
+    std::vector<uint32_t> pixels(textureWidth * textureHeight, 0xff44aa00);
+    ASSERT_TRUE(texture->write(pixels));
+
+    const uint64_t submitCountBefore = m_displayVk->getSourceBorrowSubmitCountForTesting();
+    const auto imageInfo = createBorrowedImageInfo(texture);
+    auto postResult = m_displayVk->post(imageInfo.get(), 0.0f, std::nullopt);
+    ASSERT_TRUE(postResult.success);
+    postResult.postCompletedWaitable.wait();
+
+    EXPECT_EQ(m_displayVk->getSourceBorrowSubmitCountForTesting(), submitCountBefore);
+}
+
+TEST_F(DisplayVkTest, BorrowedImmediateModePostSkipsAuxiliarySourceBorrowSubmissions) {
+    recreateDisplayWithCompositor();
+
+    constexpr uint32_t textureWidth = 20;
+    constexpr uint32_t textureHeight = 40;
+    auto texture = RenderTexture::create(*k_vk, m_vkDevice, m_vkPhysicalDevice, m_compositorVkQueue,
+                                         m_vkCommandPool, textureWidth, textureHeight);
+    ASSERT_NE(texture, nullptr);
+    std::vector<uint32_t> pixels(textureWidth * textureHeight, 0xffaa4400);
+    ASSERT_TRUE(texture->write(pixels));
+
+    const uint64_t submitCountBefore = m_displayVk->getSourceBorrowSubmitCountForTesting();
+    const auto imageInfo = createBorrowedImageInfo(texture);
+    auto postResult = m_displayVk->post(imageInfo.get(), 90.0f, std::nullopt);
+    ASSERT_TRUE(postResult.success);
+    postResult.postCompletedWaitable.wait();
+
+    EXPECT_EQ(m_displayVk->getSourceBorrowSubmitCountForTesting(), submitCountBefore);
+}
+
+TEST_F(DisplayVkTest, LeaseSwitchPostsSuccessfully) {
+    constexpr uint32_t textureWidth = 20;
+    constexpr uint32_t textureHeight = 40;
+    auto firstTexture =
+        RenderTexture::create(*k_vk, m_vkDevice, m_vkPhysicalDevice, m_compositorVkQueue,
+                              m_vkCommandPool, textureWidth, textureHeight);
+    auto secondTexture =
+        RenderTexture::create(*k_vk, m_vkDevice, m_vkPhysicalDevice, m_compositorVkQueue,
+                              m_vkCommandPool, textureWidth, textureHeight);
+    ASSERT_NE(firstTexture, nullptr);
+    ASSERT_NE(secondTexture, nullptr);
+    std::vector<uint32_t> firstPixels(textureWidth * textureHeight, 0xff0000ff);
+    std::vector<uint32_t> secondPixels(textureWidth * textureHeight, 0xff00ff00);
+    ASSERT_TRUE(firstTexture->write(firstPixels));
+    ASSERT_TRUE(secondTexture->write(secondPixels));
+
+    auto firstLease = createDisplayLeaseInfo(firstTexture, /*colorBufferHandle=*/2001);
+    auto secondLease = createDisplayLeaseInfo(secondTexture, /*colorBufferHandle=*/2002);
+
+    auto firstPost = m_displayVk->post(firstLease, 0.0f, std::nullopt);
+    ASSERT_TRUE(firstPost.success);
+    firstPost.postCompletedWaitable.wait();
+
+    auto secondPost = m_displayVk->post(secondLease, 0.0f, std::nullopt);
+    ASSERT_TRUE(secondPost.success);
+    secondPost.postCompletedWaitable.wait();
+    EXPECT_EQ(m_displayVk->getSourceBorrowSubmitCountForTesting(), 0u);
+}
+
+TEST_F(DisplayVkTest, UnbindClearsCachedLease) {
+    constexpr uint32_t textureWidth = 20;
+    constexpr uint32_t textureHeight = 40;
+    auto texture =
+        RenderTexture::create(*k_vk, m_vkDevice, m_vkPhysicalDevice, m_compositorVkQueue,
+                              m_vkCommandPool, textureWidth, textureHeight);
+    ASSERT_NE(texture, nullptr);
+    std::vector<uint32_t> pixels(textureWidth * textureHeight, 0xffcc6600);
+    ASSERT_TRUE(texture->write(pixels));
+
+    auto leaseInfo = createDisplayLeaseInfo(texture, /*colorBufferHandle=*/3001);
+
+    auto postResult = m_displayVk->post(leaseInfo, 0.0f, std::nullopt);
+    ASSERT_TRUE(postResult.success);
+    postResult.postCompletedWaitable.wait();
+
+    m_displayVk->unbindFromSurface();
+    EXPECT_FALSE(m_displayVk->getCachedLeaseColorBufferHandleForTesting().has_value());
 }
 
 }  // namespace

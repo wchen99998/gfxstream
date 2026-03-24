@@ -26,20 +26,23 @@ namespace vk {
 PostWorkerVk::PostWorkerVk(FrameBuffer* fb, Compositor* compositor, vk::DisplayVk* displayVk)
     : PostWorker(false, fb, compositor), m_displayVk(displayVk) {}
 
-std::shared_future<void> PostWorkerVk::postImpl(ColorBuffer* cb,
-              const std::optional<std::array<float, 16>>& colorTransform) {
+std::shared_future<void> PostWorkerVk::postImpl(
+    const std::shared_ptr<ColorBuffer>& cb,
+    const std::optional<std::array<float, 16>>& colorTransform) {
     std::shared_future<void> completedFuture = std::async(std::launch::deferred, [] {}).share();
     completedFuture.wait();
 
     if (!m_displayVk) {
         GFXSTREAM_FATAL("PostWorker missing DisplayVk.");
     }
+    if (!cb) {
+        GFXSTREAM_FATAL("PostWorkerVk missing ColorBuffer.");
+    }
 
     constexpr const int kMaxPostRetries = 2;
     for (int i = 0; i < kMaxPostRetries; i++) {
-        const auto imageInfo = mFb->borrowColorBufferForDisplay(cb->getHndl());
         const float rotationDegrees = static_cast<float>(mFb->getZrot());
-        auto result = m_displayVk->post(imageInfo.get(), rotationDegrees, colorTransform);
+        auto result = m_displayVk->postColorBuffer(cb, rotationDegrees, colorTransform);
         if (result.success) {
             return result.postCompletedWaitable;
         }

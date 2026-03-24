@@ -51,7 +51,6 @@ class ColorBufferVk {
     bool updateFromBytes(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const void* bytes);
 
     std::unique_ptr<BorrowedImageInfo> borrowForComposition(bool colorBufferIsTarget);
-    std::unique_ptr<BorrowedImageInfo> borrowForDisplay();
 
     void onSave(gfxstream::Stream* stream);
 

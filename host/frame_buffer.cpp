@@ -579,7 +579,6 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
 
     std::unique_ptr<BorrowedImageInfo> borrowColorBufferForComposition(uint32_t colorBufferHandle,
                                                                        bool colorBufferIsTarget);
-    std::unique_ptr<BorrowedImageInfo> borrowColorBufferForDisplay(uint32_t colorBufferHandle);
     void logVulkanDeviceLost();
 
     void setVsyncHz(int vsyncHz);
@@ -3909,28 +3908,6 @@ std::unique_ptr<BorrowedImageInfo> FrameBuffer::Impl::borrowColorBufferForCompos
     return colorBufferPtr->borrowForComposition(api, colorBufferIsTarget);
 }
 
-std::unique_ptr<BorrowedImageInfo> FrameBuffer::Impl::borrowColorBufferForDisplay(
-    uint32_t colorBufferHandle) {
-    ColorBufferPtr colorBufferPtr = findColorBuffer(colorBufferHandle);
-    if (!colorBufferPtr) {
-        GFXSTREAM_ERROR("Failed to get borrowed image info for ColorBuffer:%d", colorBufferHandle);
-        return nullptr;
-    }
-
-    if (m_useVulkanComposition) {
-        invalidateColorBufferForVk(colorBufferHandle);
-    } else {
-#if GFXSTREAM_ENABLE_HOST_GLES
-        invalidateColorBufferForGl(colorBufferHandle);
-#else
-        GFXSTREAM_ERROR("Failed to invalidate ColorBuffer:%d", colorBufferHandle);
-#endif
-    }
-
-    const auto api = m_useVulkanComposition ? ColorBuffer::UsedApi::kVk : ColorBuffer::UsedApi::kGl;
-    return colorBufferPtr->borrowForDisplay(api);
-}
-
 void FrameBuffer::Impl::logVulkanDeviceLost() {
     if (!m_emulationVk) {
         GFXSTREAM_FATAL("Device lost without VkEmulation?");
@@ -5468,11 +5445,6 @@ void FrameBuffer::setGuestManagedColorBufferLifetime(bool guestManaged) {
 std::unique_ptr<BorrowedImageInfo> FrameBuffer::borrowColorBufferForComposition(
     uint32_t colorBufferHandle, bool colorBufferIsTarget) {
     return mImpl->borrowColorBufferForComposition(colorBufferHandle, colorBufferIsTarget);
-}
-
-std::unique_ptr<BorrowedImageInfo> FrameBuffer::borrowColorBufferForDisplay(
-    uint32_t colorBufferHandle) {
-    return mImpl->borrowColorBufferForDisplay(colorBufferHandle);
 }
 
 void FrameBuffer::setVsyncHz(int vsyncHz) { mImpl->setVsyncHz(vsyncHz); }

@@ -96,7 +96,6 @@ class ColorBuffer : public LazySnapshotObj<ColorBuffer> {
         kVk,
     };
     std::unique_ptr<BorrowedImageInfo> borrowForComposition(UsedApi api, bool isTarget);
-    std::unique_ptr<BorrowedImageInfo> borrowForDisplay(UsedApi api);
 
     bool flushFromGl();
     bool flushFromVk();

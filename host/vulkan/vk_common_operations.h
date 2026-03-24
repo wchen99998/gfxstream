@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <functional>
+#include <future>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
@@ -27,9 +28,11 @@
 #include "compositor_vk.h"
 #include "debug_utils_helper.h"
 #include "device_lost_helper.h"
-#include "display_vk.h"
+#include "display_lease_vk.h"
 #include "external_memory.h"
+#include "gfxstream/CancelableFuture.h"
 #include "gfxstream/host/backend_callbacks.h"
+#include "gfxstream/host/display_surface.h"
 #include "gfxstream/host/external_object_manager.h"
 #include "gfxstream/host/features.h"
 #include "gfxstream/host/gfxstream_format.h"
@@ -64,6 +67,7 @@ namespace vk {
 using gfxstream::base::UdmabufCreator;
 
 struct VulkanDispatch;
+class DisplayVk;
 
 // Returns a consistent answer for which memory type index is best for staging
 // memory. This is not the simplest thing in the world because even if a memory
@@ -88,6 +92,12 @@ enum class AstcEmulationMode {
 // with the traditional GL pipeline.
 class VkEmulation {
    public:
+    enum class DisplayLeaseReleaseResult {
+        kReleased,
+        kBusy,
+        kNotLeased,
+    };
+
     ~VkEmulation();
 
     static std::unique_ptr<VkEmulation> create(VulkanDispatch* vk,
@@ -301,6 +311,12 @@ class VkEmulation {
         VulkanOnly = 1,
     };
 
+    enum class DisplayLeaseState {
+        kGuestOwned,
+        kDisplayOwned,
+        kReleasingToGuest,
+    };
+
     struct ColorBufferInfo {
         ExternalMemoryInfo memory;
 
@@ -322,6 +338,9 @@ class VkEmulation {
 
         VkImageLayout currentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         uint32_t currentQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+        DisplayLeaseState displayLeaseState = DisplayLeaseState::kGuestOwned;
+        uint64_t displayLeaseGeneration = 0;
+        CancelableFuture latestDisplayUseCompletion;
 
         bool glExported = false;
         bool externalMemoryCompatible = false;
@@ -430,16 +449,33 @@ class VkEmulation {
     VkImageLayout getColorBufferCurrentLayout(uint32_t colorBufferHandle);
 
     void releaseColorBufferForGuestUse(uint32_t colorBufferHandle);
+    std::unique_ptr<DisplayLeaseInfoVk> acquireColorBufferDisplayLease(uint32_t colorBufferHandle);
+    std::unique_ptr<DisplayLeaseInfoVk> acquireColorBufferDisplayLease(
+        uint32_t colorBufferHandle, CancelableFuture completionWaitable,
+        CancelableFuture* previousCompletionWaitable);
+    bool isColorBufferDisplayLeaseCurrent(const DisplayLeaseInfoVk& leaseInfo);
+    DisplayLeaseReleaseResult releaseColorBufferDisplayLease(const DisplayLeaseInfoVk& leaseInfo,
+                                                             bool waitForCompletion);
+    void releaseAllDisplayLeases();
+    bool handoffColorBufferDisplayLeaseToGuestIfNeeded(uint32_t colorBufferHandle);
+    void setColorBufferLatestDisplayUseCompletion(const DisplayLeaseInfoVk& leaseInfo,
+                                                  CancelableFuture completionWaitable);
 
     std::unique_ptr<BorrowedImageInfoVk> borrowColorBufferForComposition(uint32_t colorBufferHandle,
                                                                          bool colorBufferIsTarget);
-    std::unique_ptr<BorrowedImageInfoVk> borrowColorBufferForDisplay(uint32_t colorBufferHandle);
 
    private:
     VkEmulation() = default;
 
     std::optional<host::RepresentativeColorBufferMemoryTypeInfo>
     findRepresentativeColorBufferMemoryTypeIndexLocked() REQUIRES(mMutex);
+    std::unique_ptr<DisplayLeaseInfoVk> acquireColorBufferDisplayLeaseLocked(
+        uint32_t colorBufferHandle) REQUIRES(mMutex);
+    bool releaseColorBufferForGuestUseLocked(ColorBufferInfo* infoPtr, uint32_t colorBufferHandle)
+        REQUIRES(mMutex);
+    DisplayLeaseReleaseResult reclaimColorBufferDisplayLeaseInternal(
+        uint32_t colorBufferHandle, std::optional<uint64_t> expectedLeaseGeneration,
+        bool requireActiveLease, bool waitForCompletion);
 
     // For a given ImageSupportInfo, populates usageWithExternalHandles and
     // requiresDedicatedAllocation. memoryTypeBits are populated later once the

@@ -38,7 +38,8 @@ class PostWorkerGl : public PostWorker, public DisplaySurfaceUser {
 
    protected:
     std::shared_future<void> postImpl(
-        ColorBuffer* cb, const std::optional<std::array<float, 16>>& colorTransform) override;
+        const std::shared_ptr<ColorBuffer>& cb,
+        const std::optional<std::array<float, 16>>& colorTransform) override;
     void viewportImpl(int width, int height) override;
     void clearImpl() override;
     void exitImpl() override;

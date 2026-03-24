@@ -86,7 +86,6 @@ class ColorBuffer::Impl : public LazySnapshotObj<ColorBuffer::Impl> {
     bool updateGlFromBytes(const void* bytes, std::size_t bytesSize);
 
     std::unique_ptr<BorrowedImageInfo> borrowForComposition(UsedApi api, bool isTarget);
-    std::unique_ptr<BorrowedImageInfo> borrowForDisplay(UsedApi api);
 
     bool flushFromGl();
     bool flushFromVk();
@@ -446,31 +445,6 @@ std::unique_ptr<BorrowedImageInfo> ColorBuffer::Impl::borrowForComposition(UsedA
                 GFXSTREAM_FATAL("ColorBufferVk not available");
             }
             return mColorBufferVk->borrowForComposition(isTarget);
-        }
-    }
-    GFXSTREAM_FATAL("%s: Unimplemented", __func__);
-    return nullptr;
-}
-
-std::unique_ptr<BorrowedImageInfo> ColorBuffer::Impl::borrowForDisplay(UsedApi api) {
-    switch (api) {
-        case UsedApi::kGl: {
-#if GFXSTREAM_ENABLE_HOST_GLES
-            if (!mColorBufferGl) {
-                GFXSTREAM_FATAL("ColorBufferGl not available");
-            }
-            if (!invalidateForGl()) {
-                GFXSTREAM_ERROR("Failed to sync ColorBuffer:%d for GL display borrow.", mHandle);
-                return nullptr;
-            }
-            return mColorBufferGl->getBorrowedImageInfo();
-#endif
-        }
-        case UsedApi::kVk: {
-            if (!mColorBufferVk) {
-                GFXSTREAM_FATAL("ColorBufferVk not available");
-            }
-            return mColorBufferVk->borrowForDisplay();
         }
     }
     GFXSTREAM_FATAL("%s: Unimplemented", __func__);
@@ -1051,10 +1025,6 @@ bool ColorBuffer::updateGlFromBytes(const void* bytes, std::size_t bytesSize) {
 
 std::unique_ptr<BorrowedImageInfo> ColorBuffer::borrowForComposition(UsedApi api, bool isTarget) {
     return mImpl->borrowForComposition(api, isTarget);
-}
-
-std::unique_ptr<BorrowedImageInfo> ColorBuffer::borrowForDisplay(UsedApi api) {
-    return mImpl->borrowForDisplay(api);
 }
 
 bool ColorBuffer::flushFromGl() { return mImpl->flushFromGl(); }

@@ -7317,6 +7317,7 @@ class VkDecoderGlobalState::Impl {
         }
 
         for (HandleType cb : acquiredColorBuffers) {
+            m_vkEmulation->handoffColorBufferDisplayLeaseToGuestIfNeeded(cb);
             m_vkEmulation->getCallbacks().invalidateColorBuffer(cb);
         }
 
@@ -8480,7 +8481,6 @@ class VkDecoderGlobalState::Impl {
 
         auto queue = unbox_VkQueue(boxed_queue);
         auto vk = dispatch_VkQueue(boxed_queue);
-
         if (!hasTimelineSemaphoreSubmitInfo) {
             (void)pool;
             return vk->vkQueueBindSparse(queue, bindInfoCount, pBindInfo, fence);
