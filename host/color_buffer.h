@@ -18,11 +18,13 @@
 #include <GLES3/gl3.h>
 #endif
 
+#include <atomic>
 #include <array>
 #include <memory>
 #include <optional>
 
 #include "framework_formats.h"
+#include "gfxstream/CancelableFuture.h"
 #include "gfxstream/host/borrowed_image.h"
 #include "gfxstream/host/external_object_manager.h"
 #include "gfxstream/host/gfxstream_format.h"
@@ -94,13 +96,16 @@ class ColorBuffer : public LazySnapshotObj<ColorBuffer> {
         kVk,
     };
     std::unique_ptr<BorrowedImageInfo> borrowForComposition(UsedApi api, bool isTarget);
-    std::unique_ptr<BorrowedImageInfo> borrowForDisplay(UsedApi api);
 
     bool flushFromGl();
     bool flushFromVk();
     bool flushFromVkBytes(const void* bytes, size_t bytesSize);
     bool invalidateForGl();
     bool invalidateForVk();
+    bool waitForPendingVulkanCompletion();
+    bool hasPendingVulkanCompletion();
+    void setPendingVulkanCompletion(CancelableFuture completionFuture,
+                                    std::shared_ptr<std::atomic<bool>> completionSucceeded);
 
     std::optional<BlobDescriptorInfo> exportBlob();
 

@@ -20,6 +20,7 @@
 #include <deque>
 #include <functional>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <variant>
@@ -34,13 +35,17 @@ namespace vk {
 class DeviceOpTracker;
 using DeviceOpTrackerPtr = std::shared_ptr<DeviceOpTracker>;
 
-using DeviceOpWaitable = std::shared_future<void>;
+enum class DeviceOpStatus { kPending, kDone, kFailure };
+
+using DeviceOpWaitable = std::shared_future<DeviceOpStatus>;
 
 inline bool IsDone(const DeviceOpWaitable& waitable) {
     return waitable.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
 }
 
-enum class DeviceOpStatus { kPending, kDone, kFailure };
+inline DeviceOpStatus GetStatus(const DeviceOpWaitable& waitable) {
+    return waitable.get();
+}
 
 // Helper class to track the completion of host operations for a specific VkDevice.
 class DeviceOpTracker {
@@ -115,11 +120,19 @@ class DeviceOpBuilder {
     // has completed.
     DeviceOpWaitable OnQueueSubmittedWithFence(VkFence fence);
 
+    // Same as above, but runs |onSuccess| after the queue work has completed
+    // successfully. The callback is skipped on fence wait failures.
+    DeviceOpWaitable OnQueueSubmittedWithFence(VkFence fence, std::function<void()> onSuccess);
+
+    // Marks that queue submission failed before OnQueueSubmittedWithFence() could be called.
+    void MarkSubmissionFailed();
+
    private:
     DeviceOpTracker& mTracker;
 
     std::optional<VkFence> mCreatedFence;
     std::optional<VkFence> mSubmittedFence;
+    bool mSubmissionHandled = false;
 };
 
 }  // namespace vk

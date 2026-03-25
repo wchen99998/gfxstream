@@ -16,16 +16,15 @@
 #define DISPLAY_VK_H
 
 #include <deque>
-#include <functional>
 #include <future>
 #include <memory>
 #include <optional>
-#include <tuple>
 #include <unordered_map>
-#include <unordered_set>
+#include <vector>
 
 #include "gfxstream/host/borrowed_image.h"
 #include "compositor_vk.h"
+#include "display_lease_vk.h"
 #include "gfxstream/host/display.h"
 #include "display_surface_vk.h"
 #include "host/hwc2.h"
@@ -38,7 +37,13 @@
 
 namespace gfxstream {
 namespace host {
+class ColorBuffer;
+
 namespace vk {
+
+class VkEmulation;
+class PostWorkerVk;
+struct BorrowedImageInfoVk;
 
 class DisplayVk : public Display {
    public:
@@ -46,14 +51,23 @@ class DisplayVk : public Display {
               uint32_t compositorQueueFamilyIndex, VkQueue compositorVkQueue,
               std::shared_ptr<gfxstream::base::Lock> compositorVkQueueLock,
               uint32_t swapChainQueueFamilyIndex, VkQueue swapChainVkQueue,
-              std::shared_ptr<gfxstream::base::Lock> swapChainVkQueueLock);
+              std::shared_ptr<gfxstream::base::Lock> swapChainVkQueueLock,
+              VkEmulation* vkEmulation = nullptr);
     ~DisplayVk();
 
     PostResult post(const BorrowedImageInfo* info, float rotationDegrees,
                     const std::optional<std::array<float, 16>>& colorTransform);
+    PostResult post(const DisplayLeaseInfoVk& info, float rotationDegrees,
+                    const std::optional<std::array<float, 16>>& colorTransform);
+    PostResult postColorBuffer(const std::shared_ptr<ColorBuffer>& colorBuffer,
+                               float rotationDegrees,
+                               const std::optional<std::array<float, 16>>& colorTransform);
 
     void drainQueues();
     void clear();
+
+    uint64_t getSourceBorrowSubmitCountForTesting() const;
+    std::optional<uint32_t> getCachedLeaseColorBufferHandleForTesting() const;
 
    protected:
     void bindToSurfaceImpl(DisplaySurface* surface) override;
@@ -61,17 +75,42 @@ class DisplayVk : public Display {
     void unbindFromSurfaceImpl() override;
 
    private:
+    friend class PostWorkerVk;
+
     class PostResource;
+    struct PendingPost;
+    struct SourceImageBarriers {
+        std::vector<VkImageMemoryBarrier> preUseQueueTransferBarriers;
+        std::vector<VkImageMemoryBarrier> preUseLayoutTransitionBarriers;
+        std::vector<VkImageMemoryBarrier> postUseLayoutTransitionBarriers;
+        std::vector<VkImageMemoryBarrier> postUseQueueTransferBarriers;
+    };
+
+    static SourceImageBarriers buildSourceImageBarriers(const BorrowedImageInfoVk& info,
+                                                        uint32_t usedQueueFamilyIndex);
     void destroySwapchain();
     bool recreateSwapchain();
+    bool reclaimPendingPost(std::optional<PendingPost>& pendingPost, bool waitForCompletion);
+    void reclaimPendingPosts(bool waitForCompletion);
+    void retireActiveColorBufferLease();
+    void reclaimRetiredColorBufferLeases(bool waitForCompletion);
+    void releaseRetainedColorBufferLeases(bool waitForCompletion);
+    bool isActiveColorBufferLeaseCurrent(uint32_t colorBufferHandle) const;
 
     // The success component of the result is false when the swapchain is no longer valid and
     // bindToSurface() needs to be called again. When the success component is true, the waitable
     // component of the returned result is a future that will complete when the GPU side of work
     // completes. The caller is responsible to guarantee the synchronization and the layout of
     // ColorBufferCompositionInfo::m_vkImage is VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL.
-    PostResult postImpl(const BorrowedImageInfo* info, float rotationDegrees,
-                        const std::optional<std::array<float, 16>>& colorTransform);
+    PostResult postBorrowedImageImpl(const BorrowedImageInfoVk& info, float rotationDegrees,
+                                     const std::optional<std::array<float, 16>>& colorTransform);
+    PostResult postLeaseImpl(const DisplayLeaseInfoVk& info, float rotationDegrees,
+                             const std::optional<std::array<float, 16>>& colorTransform);
+    PostResult postSourceImageImpl(VkImage image, VkImageView imageView,
+                                   const VkImageCreateInfo& imageCreateInfo,
+                                   const SourceImageBarriers& sourceImageBarriers,
+                                   float rotationDegrees,
+                                   const std::optional<std::array<float, 16>>& colorTransform);
 
     VkFormatFeatureFlags getFormatFeatures(VkFormat, VkImageTiling);
     bool canPost(const VkImageCreateInfo&);
@@ -89,6 +128,7 @@ class DisplayVk : public Display {
     VkQueue m_swapChainVkQueue;
     std::shared_ptr<gfxstream::base::Lock> m_swapChainVkQueueLock;
     VkCommandPool m_vkCommandPool;
+    VkEmulation* const m_vkEmulation;
 
     class PostResource {
        public:
@@ -109,31 +149,27 @@ class DisplayVk : public Display {
         const VkCommandPool m_vkCommandPool;
     };
 
-    std::deque<std::shared_ptr<PostResource>> m_freePostResources;
-    std::vector<std::optional<std::shared_future<std::shared_ptr<PostResource>>>>
-        m_postResourceFutures;
-    int m_inFlightFrameIndex;
-
-    class ImageBorrowResource {
-       public:
-        const VkFence m_completeFence;
-        const VkCommandBuffer m_vkCommandBuffer;
-        static std::unique_ptr<ImageBorrowResource> create(const VulkanDispatch&, VkDevice,
-                                                           VkCommandPool);
-        ~ImageBorrowResource();
-        DISALLOW_COPY_ASSIGN_AND_MOVE(ImageBorrowResource);
-
-       private:
-        ImageBorrowResource(const VulkanDispatch&, VkDevice, VkCommandPool, VkFence,
-                            VkCommandBuffer);
-        const VulkanDispatch& m_vk;
-        const VkDevice m_vkDevice;
-        const VkCommandPool m_vkCommandPool;
+    struct PendingPost {
+        VkFence m_completeFence = VK_NULL_HANDLE;
+        std::shared_future<std::shared_ptr<PostResource>> m_postResourceFuture;
     };
-    std::vector<std::unique_ptr<ImageBorrowResource>> m_imageBorrowResources;
+
+    struct RetainedDisplayLease {
+        DisplayLeaseInfoVk info;
+        std::shared_ptr<ColorBuffer> colorBuffer;
+    };
+
+    std::deque<std::shared_ptr<PostResource>> m_freePostResources;
+    std::vector<std::optional<PendingPost>> m_pendingPosts;
+    int m_inFlightFrameIndex;
 
     std::unique_ptr<SwapChainStateVk> m_swapChainStateVk;
     bool m_needToRecreateSwapChain = true;
+
+    // The display lease must retain the ColorBuffer lifetime. Otherwise a guest-process cleanup
+    // can destroy the backing VkImage while DisplayVk still owns the lease for it.
+    std::optional<RetainedDisplayLease> m_activeColorBufferLease;
+    std::vector<RetainedDisplayLease> m_retiredColorBufferLeases;
 
     std::unordered_map<VkFormat, VkFormatProperties> m_vkFormatProperties;
 };

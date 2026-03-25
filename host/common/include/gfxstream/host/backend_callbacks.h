@@ -14,7 +14,9 @@
 
 #pragma once
 
+#include <atomic>
 #include <functional>
+#include <memory>
 
 #include "gfxstream/CancelableFuture.h"
 
@@ -38,6 +40,11 @@ struct BackendCallbacks {
     using FlushColorBufferFromBytesFunc =
         std::function<void(uint32_t colorBufferHandle, const void* bytes, size_t bytesSize)>;
     FlushColorBufferFromBytesFunc flushColorBufferFromBytes;
+
+    using SetColorBufferPendingVulkanCompletionFunc =
+        std::function<void(uint32_t colorBufferHandle, CancelableFuture completionFuture,
+                           std::shared_ptr<std::atomic<bool>> completionSucceeded)>;
+    SetColorBufferPendingVulkanCompletionFunc setColorBufferPendingVulkanCompletion;
 
     using ScheduleAsyncWorkFunc =
         std::function<CancelableFuture(std::function<void()> work, std::string description)>;

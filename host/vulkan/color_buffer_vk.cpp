@@ -85,10 +85,6 @@ std::unique_ptr<BorrowedImageInfo> ColorBufferVk::borrowForComposition(bool colo
     return mVkEmulation.borrowColorBufferForComposition(mHandle, colorBufferIsTarget);
 }
 
-std::unique_ptr<BorrowedImageInfo> ColorBufferVk::borrowForDisplay() {
-    return mVkEmulation.borrowColorBufferForDisplay(mHandle);
-}
-
 std::optional<BlobDescriptorInfo> ColorBufferVk::exportBlob() {
     auto info = mVkEmulation.exportColorBufferMemory(mHandle);
     if (info) {

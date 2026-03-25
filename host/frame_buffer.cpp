@@ -16,6 +16,7 @@
 
 #include "frame_buffer.h"
 
+#include <algorithm>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -578,7 +579,6 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
 
     std::unique_ptr<BorrowedImageInfo> borrowColorBufferForComposition(uint32_t colorBufferHandle,
                                                                        bool colorBufferIsTarget);
-    std::unique_ptr<BorrowedImageInfo> borrowColorBufferForDisplay(uint32_t colorBufferHandle);
     void logVulkanDeviceLost();
 
     void setVsyncHz(int vsyncHz);
@@ -828,7 +828,21 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
 
     AsyncResult postImpl(HandleType p_colorbuffer, Post::CompletionCallback callback,
                          bool needLockAndBind = true, bool repaint = false);
+    AsyncResult postColorBufferWithCallback(const ColorBufferPtr& colorBuffer,
+                                           HandleType p_colorbuffer,
+                                           Post::CompletionCallback callback,
+                                           bool needLockAndBind, bool repaint,
+                                           bool holdColorBufferMapRef);
     bool postImplSync(HandleType p_colorbuffer, bool needLockAndBind = true, bool repaint = false);
+    std::optional<AutoLock> lockFrameBufferForColorBufferGlUse(const ColorBufferPtr& colorBuffer);
+    std::vector<ColorBufferPtr> getOnPostReadbackColorBuffersLocked(
+        const ColorBufferPtr& postedColorBuffer);
+    std::optional<AutoLock> lockFrameBufferForOnPostReadback(
+        const ColorBufferPtr& postedColorBuffer);
+    uint64_t reserveColorBufferPostSequenceLocked(HandleType colorBufferHandle);
+    bool isColorBufferPostSequenceCurrentLocked(HandleType colorBufferHandle,
+                                                uint64_t sequence) const;
+    void eraseColorBufferPostSequenceLocked(HandleType colorBufferHandle);
     void setGuestPostedAFrame() {
         m_guestPostedAFrame = true;
         m_framebuffer->fireEvent({FrameBufferChange::FrameReady, mFrameNumber++});
@@ -933,6 +947,8 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
         }
     };
     std::map<uint32_t, onPost> m_onPost;
+    uint64_t mPresentationStateGeneration = 0;
+    std::unordered_map<HandleType, uint64_t> mColorBufferPostSequences;
 #if GFXSTREAM_ENABLE_HOST_GLES
     ReadbackWorker* m_readbackWorker = nullptr;
 #endif
@@ -1167,6 +1183,18 @@ std::unique_ptr<FrameBuffer::Impl> FrameBuffer::Impl::Create(FrameBuffer* frameb
                 [impl = impl.get()](uint32_t colorBufferHandle, const void* bytes,
                                     size_t bytesSize) {
                     impl->flushColorBufferFromVkBytes(colorBufferHandle, bytes, bytesSize);
+                },
+            .setColorBufferPendingVulkanCompletion =
+                [impl = impl.get()](uint32_t colorBufferHandle, CancelableFuture completionFuture,
+                                    std::shared_ptr<std::atomic<bool>> completionSucceeded) {
+                    AutoLock mutex(impl->m_lock);
+                    auto colorBuffer = impl->findColorBuffer(colorBufferHandle);
+                    if (!colorBuffer) {
+                        GFXSTREAM_ERROR("Failed to find ColorBuffer:%d", colorBufferHandle);
+                        return;
+                    }
+                    colorBuffer->setPendingVulkanCompletion(std::move(completionFuture),
+                                                            std::move(completionSucceeded));
                 },
             .scheduleAsyncWork =
                 [impl = impl.get()](std::function<void()> work, std::string description) {
@@ -1515,6 +1543,9 @@ WorkerProcessingResult FrameBuffer::Impl::postWorkerFunc(Post& post) {
             // We wrap the callback like this to workaround a bug in the MS STL implementation.
             auto packagePostCmdCallback =
                 std::shared_ptr<Post::CompletionCallback>(std::move(post.completionCallback));
+            if (!post.retainedColorBuffer) {
+                GFXSTREAM_FATAL("Post command missing retained ColorBuffer.");
+            }
             std::unique_ptr<Post::CompletionCallback> postCallback =
                 std::make_unique<Post::CompletionCallback>(
                     [packagePostCmdCallback](std::shared_future<void> waitForGpu) {
@@ -1524,7 +1555,8 @@ WorkerProcessingResult FrameBuffer::Impl::postWorkerFunc(Post& post) {
                             },
                             "Wait for post");
                     });
-            m_postWorker->post(post.cb, std::move(postCallback), post.colorTransform);
+            m_postWorker->post(std::move(post.retainedColorBuffer), std::move(postCallback),
+                               post.colorTransform);
             decColorBufferRefCountNoDestroy(post.cbHandle);
             break;
         }
@@ -1638,6 +1670,7 @@ void FrameBuffer::Impl::setPostCallback(Renderer::OnPostCallback onPost, void* o
         m_onPost[displayId].height = h;
         m_onPost[displayId].img = new unsigned char[4 * w * h];
         m_onPost[displayId].readBgra = useBgraReadback;
+        ++mPresentationStateGeneration;
         bool expectedReadbackThreadStarted = false;
         if (m_readbackThreadStarted.compare_exchange_strong(expectedReadbackThreadStarted, true)) {
             m_readbackThread.start();
@@ -1651,6 +1684,7 @@ void FrameBuffer::Impl::setPostCallback(Renderer::OnPostCallback onPost, void* o
             {ReadbackCmd::DelRecordDisplay, displayId});
         completeFuture.wait();
         m_onPost.erase(displayId);
+        ++mPresentationStateGeneration;
     }
 }
 
@@ -1729,6 +1763,9 @@ bool FrameBuffer::Impl::setupSubWindow(FBNativeWindowType p_window, int wx, int 
     }
 
     AutoLock mutex(m_lock);
+    HandleType redrawColorBuffer = 0;
+    bool redrawNeedsClear = false;
+    bool redrawWithVulkanDisplay = false;
     if (deleteExisting) {
         removeSubWindow_locked();
     }
@@ -1840,37 +1877,44 @@ bool FrameBuffer::Impl::setupSubWindow(FBNativeWindowType p_window, int wx, int 
             // the last posted color buffer.
             m_dpr = dpr;
             m_zRot = zRot;
-            if (m_displayVk == nullptr) {
-                Post postCmd;
-                postCmd.cmd = PostCmd::Viewport;
-                postCmd.viewport.width = fbw;
-                postCmd.viewport.height = fbh;
-                sendPostWorkerCmd(std::move(postCmd));
-
-                if (m_lastPostedColorBuffer) {
-                    GFXSTREAM_DEBUG("setupSubwindow: draw last posted cb");
-                    postImpl(m_lastPostedColorBuffer,
-                        [](std::shared_future<void> waitForGpu) {}, false);
-                } else {
-                    Post clearCmd;
-                    clearCmd.cmd = PostCmd::Clear;
-                    sendPostWorkerCmd(std::move(clearCmd));
-                }
-            } else {
-                if (m_lastPostedColorBuffer) {
-                    GFXSTREAM_DEBUG("setupSubwindow: draw last posted cb");
-                    postImpl(m_lastPostedColorBuffer,
-                        [](std::shared_future<void> waitForGpu) {
-                            waitForGpu.wait();
-                        }, false);
-                }
-            }
+            redrawColorBuffer = m_lastPostedColorBuffer;
+            redrawNeedsClear = m_displayVk == nullptr && redrawColorBuffer == 0;
+            redrawWithVulkanDisplay = m_displayVk != nullptr;
             m_windowContentFullWidth = fbw;
             m_windowContentFullHeight = fbh;
         }
     }
 
     mutex.unlock();
+
+    if (success && redrawSubwindow) {
+        if (!redrawWithVulkanDisplay) {
+            Post postCmd;
+            postCmd.cmd = PostCmd::Viewport;
+            postCmd.viewport.width = fbw;
+            postCmd.viewport.height = fbh;
+            sendPostWorkerCmd(std::move(postCmd));
+        }
+
+        if (redrawColorBuffer) {
+            GFXSTREAM_DEBUG("setupSubwindow: draw last posted cb");
+            if (redrawWithVulkanDisplay) {
+                postImpl(redrawColorBuffer,
+                         [](std::shared_future<void> waitForGpu) {
+                             waitForGpu.wait();
+                         },
+                         /*needLockAndBind=*/true);
+            } else {
+                postImpl(redrawColorBuffer,
+                         [](std::shared_future<void>) {},
+                         /*needLockAndBind=*/true);
+            }
+        } else if (redrawNeedsClear) {
+            Post clearCmd;
+            clearCmd.cmd = PostCmd::Clear;
+            sendPostWorkerCmd(std::move(clearCmd));
+        }
+    }
 
     // Nobody ever checks for the return code, so there will be no retries or
     // even aborted run; if we don't mark the framebuffer as initialized here
@@ -2175,6 +2219,7 @@ bool FrameBuffer::Impl::closeColorBufferLocked(HandleType p_colorbuffer, bool fo
         if (--c->second.refcount == 0) {
             if (forced) {
                 eraseDelayedCloseColorBufferLocked(c->first, c->second.closedTs);
+                eraseColorBufferPostSequenceLocked(c->first);
                 m_colorbuffers.erase(c);
                 deleted = true;
             } else {
@@ -2219,6 +2264,7 @@ void FrameBuffer::Impl::performDelayedColorBufferCloseLocked(bool forced) {
             AutoLock colorBufferMapLock(m_colorBufferMapLock);
             const auto& cb = m_colorbuffers.find(it->cbHandle);
             if (cb != m_colorbuffers.end()) {
+                eraseColorBufferPostSequenceLocked(it->cbHandle);
                 m_colorbuffers.erase(cb);
             }
         }
@@ -2424,14 +2470,17 @@ void FrameBuffer::Impl::readColorBuffer(HandleType p_colorbuffer, int x, int y, 
     GFXSTREAM_TRACE_EVENT(GFXSTREAM_TRACE_DEFAULT_CATEGORY, "FrameBuffer::Impl::readColorBuffer()",
                           "ColorBuffer", p_colorbuffer);
 
-    AutoLock mutex(m_lock);
-
     ColorBufferPtr colorBuffer = findColorBuffer(p_colorbuffer);
     if (!colorBuffer) {
         // bad colorbuffer handle
         return;
     }
 
+    auto lock = lockFrameBufferForColorBufferGlUse(colorBuffer);
+    if (!lock) {
+        GFXSTREAM_FATAL("Failed to resolve pending Vulkan completion for ColorBuffer:%d",
+                        p_colorbuffer);
+    }
     colorBuffer->readToBytes(x, y, width, height, pixelsFormat, outPixels, outPixelsSize);
 }
 
@@ -2452,14 +2501,17 @@ void FrameBuffer::Impl::readColorBufferDeprecated(HandleType colorbuffer, int x,
 
 void FrameBuffer::Impl::readColorBufferYUV(HandleType p_colorbuffer, int x, int y, int width,
                                            int height, void* outPixels, uint32_t outPixelsSize) {
-    AutoLock mutex(m_lock);
-
     ColorBufferPtr colorBuffer = findColorBuffer(p_colorbuffer);
     if (!colorBuffer) {
         // bad colorbuffer handle
         return;
     }
 
+    auto lock = lockFrameBufferForColorBufferGlUse(colorBuffer);
+    if (!lock) {
+        GFXSTREAM_FATAL("Failed to resolve pending Vulkan completion for ColorBuffer:%d",
+                        p_colorbuffer);
+    }
     colorBuffer->readYuvToBytes(x, y, width, height, outPixels, outPixelsSize);
 }
 
@@ -2608,20 +2660,49 @@ AsyncResult FrameBuffer::Impl::postImpl(HandleType p_colorbuffer, Post::Completi
         return AsyncResult::FAIL_AND_CALLBACK_NOT_SCHEDULED;
     }
 
+    return postColorBufferWithCallback(colorBuffer, p_colorbuffer, callback, needLockAndBind,
+                                       repaint, /*holdColorBufferMapRef=*/true);
+}
+
+AsyncResult FrameBuffer::Impl::postColorBufferWithCallback(const ColorBufferPtr& colorBuffer,
+                                                           HandleType p_colorbuffer,
+                                                           Post::CompletionCallback callback,
+                                                           bool needLockAndBind, bool repaint,
+                                                           bool holdColorBufferMapRef) {
     std::optional<AutoLock> lock;
 #if GFXSTREAM_ENABLE_HOST_GLES
     std::optional<RecursiveScopedContextBind> bind;
 #endif
     if (needLockAndBind) {
-        lock.emplace(m_lock);
+        auto acquiredLock = lockFrameBufferForOnPostReadback(colorBuffer);
+        if (!acquiredLock) {
+            if (holdColorBufferMapRef) {
+                AutoLock cleanupLock(m_lock);
+                decColorBufferRefCountLocked(p_colorbuffer);
+            }
+            GFXSTREAM_ERROR("Failed to resolve pending Vulkan completion for ColorBuffer:%d",
+                            p_colorbuffer);
+            return AsyncResult::FAIL_AND_CALLBACK_NOT_SCHEDULED;
+        }
+        lock.emplace(std::move(*acquiredLock));
 #if GFXSTREAM_ENABLE_HOST_GLES
         if (m_emulationGl) {
             bind.emplace(getPbufferSurfaceContextHelper());
+            if (!bind->isOk()) {
+                if (holdColorBufferMapRef) {
+                    decColorBufferRefCountLocked(p_colorbuffer);
+                }
+                GFXSTREAM_ERROR("Failed to bind pbuffer context for post.");
+                return AsyncResult::FAIL_AND_CALLBACK_NOT_SCHEDULED;
+            }
         }
 #endif
     }
     AsyncResult ret = AsyncResult::FAIL_AND_CALLBACK_NOT_SCHEDULED;
 
+    if (p_colorbuffer) {
+        reserveColorBufferPostSequenceLocked(p_colorbuffer);
+    }
     m_lastPostedColorBuffer = p_colorbuffer;
 
     colorBuffer->touch();
@@ -2629,7 +2710,8 @@ AsyncResult FrameBuffer::Impl::postImpl(HandleType p_colorbuffer, Post::Completi
         Post postCmd;
         postCmd.cmd = PostCmd::Post;
         postCmd.cb = colorBuffer.get();
-        postCmd.cbHandle = p_colorbuffer;
+        postCmd.cbHandle = holdColorBufferMapRef ? p_colorbuffer : 0;
+        postCmd.retainedColorBuffer = colorBuffer;
         postCmd.colorTransform = GetColorTransform();
         postCmd.completionCallback = std::make_unique<Post::CompletionCallback>(callback);
         sendPostWorkerCmd(std::move(postCmd));
@@ -2698,7 +2780,7 @@ AsyncResult FrameBuffer::Impl::postImpl(HandleType p_colorbuffer, Post::Completi
         }
     }
 
-    if (!m_subWin) {  // m_subWin is supposed to be false
+    if (!m_subWin && holdColorBufferMapRef) {  // m_subWin is supposed to be false
         decColorBufferRefCountLocked(p_colorbuffer);
     }
 
@@ -2969,6 +3051,7 @@ bool FrameBuffer::Impl::decColorBufferRefCountLocked(HandleType p_colorbuffer) {
     if (it != m_colorbuffers.end()) {
         it->second.refcount -= 1;
         if (it->second.refcount == 0) {
+            eraseColorBufferPostSequenceLocked(p_colorbuffer);
             m_colorbuffers.erase(p_colorbuffer);
             return true;
         }
@@ -2999,6 +3082,67 @@ bool FrameBuffer::Impl::compose(uint32_t bufferSize, void* buffer, bool needPost
         }
     }
 
+    const auto& multiDisplay = get_gfxstream_multi_display_operations();
+    const bool is_pixel_fold = multiDisplay.is_pixel_fold();
+    std::optional<HandleType> postTargetHandle;
+    ColorBufferPtr postTargetColorBuffer;
+    uint64_t postTargetSequence = 0;
+    if (needPost && composeDevice) {
+        switch (composeDevice->version) {
+            case 1:
+                postTargetHandle = composeDevice->targetHandle;
+                break;
+            case 2: {
+                auto* composeDeviceV2 = reinterpret_cast<ComposeDevice_v2*>(buffer);
+                if (is_pixel_fold || composeDeviceV2->displayId == 0) {
+                    postTargetHandle = composeDeviceV2->targetHandle;
+                }
+                break;
+            }
+            default:
+                return false;
+        }
+    }
+    if (postTargetHandle.has_value()) {
+        postTargetColorBuffer = findColorBuffer(*postTargetHandle);
+        AutoLock lock(m_lock);
+        postTargetSequence = reserveColorBufferPostSequenceLocked(*postTargetHandle);
+    }
+
+    if (m_features.AsyncComposeSupport.enabled) {
+        auto composeRes = composeWithCallback(
+            bufferSize, buffer,
+            [this, postTargetHandle, postTargetColorBuffer,
+             postTargetSequence](std::shared_future<void> waitForGpu) {
+                if (!postTargetHandle.has_value() || !postTargetColorBuffer) {
+                    return;
+                }
+
+                waitForGpu.wait();
+                {
+                    AutoLock lock(m_lock);
+                    if (!isColorBufferPostSequenceCurrentLocked(*postTargetHandle,
+                                                               postTargetSequence)) {
+                        return;
+                    }
+                }
+                // This callback already runs on SyncThread. Calling the synchronous
+                // post() path here recursively queues more SyncThread work and can
+                // deadlock all workers while waiting for post completion.
+                AsyncResult postRes = postColorBufferWithCallback(
+                    postTargetColorBuffer, *postTargetHandle,
+                    [postTargetHandle](std::shared_future<void>) {
+                        GFXSTREAM_VERBOSE("Async compose post completed for ColorBuffer:%u",
+                                          *postTargetHandle);
+                    },
+                    /*needLockAndBind=*/true,
+                    /*repaint=*/false,
+                    /*holdColorBufferMapRef=*/false);
+                (void)postRes;
+            });
+        return composeRes.Succeeded();
+    }
+
     std::promise<void> promise;
     std::future<void> completeFuture = promise.get_future();
     auto composeRes =
@@ -3014,8 +3158,6 @@ bool FrameBuffer::Impl::compose(uint32_t bufferSize, void* buffer, bool needPost
         completeFuture.wait();
     }
 
-    const auto& multiDisplay = get_gfxstream_multi_display_operations();
-    const bool is_pixel_fold = multiDisplay.is_pixel_fold();
     if (needPost) {
         switch (composeDevice->version) {
             case 1: {
@@ -3486,6 +3628,109 @@ void FrameBuffer::Impl::lock() { m_lock.lock(); }
 
 void FrameBuffer::Impl::unlock() { m_lock.unlock(); }
 
+std::optional<AutoLock> FrameBuffer::Impl::lockFrameBufferForColorBufferGlUse(
+    const ColorBufferPtr& colorBuffer) {
+    while (true) {
+        if (!colorBuffer->waitForPendingVulkanCompletion()) {
+            return std::nullopt;
+        }
+
+        std::optional<AutoLock> lock(m_lock);
+        if (colorBuffer->hasPendingVulkanCompletion()) {
+            lock.reset();
+            continue;
+        }
+
+        return lock;
+    }
+}
+
+std::vector<ColorBufferPtr> FrameBuffer::Impl::getOnPostReadbackColorBuffersLocked(
+    const ColorBufferPtr& postedColorBuffer) {
+    std::vector<ColorBufferPtr> readbackColorBuffers;
+    readbackColorBuffers.reserve(m_onPost.size());
+
+    for (const auto& iter : m_onPost) {
+        if (iter.first == 0) {
+            readbackColorBuffers.push_back(postedColorBuffer);
+            continue;
+        }
+
+        uint32_t displayColorBufferHandle = 0;
+        if (getDisplayColorBuffer(iter.first, &displayColorBufferHandle) < 0) {
+            continue;
+        }
+
+        ColorBufferPtr cb = findColorBuffer(displayColorBufferHandle);
+        if (cb) {
+            readbackColorBuffers.push_back(std::move(cb));
+        }
+    }
+
+    return readbackColorBuffers;
+}
+
+std::optional<AutoLock> FrameBuffer::Impl::lockFrameBufferForOnPostReadback(
+    const ColorBufferPtr& postedColorBuffer) {
+    while (true) {
+        uint64_t presentationStateGeneration = 0;
+        std::vector<ColorBufferPtr> readbackColorBuffers;
+        {
+            AutoLock lock(m_lock);
+            presentationStateGeneration = mPresentationStateGeneration;
+            readbackColorBuffers = getOnPostReadbackColorBuffersLocked(postedColorBuffer);
+        }
+
+        for (const auto& readbackColorBuffer : readbackColorBuffers) {
+            if (!readbackColorBuffer->waitForPendingVulkanCompletion()) {
+                return std::nullopt;
+            }
+        }
+
+        std::optional<AutoLock> lock(m_lock);
+        if (presentationStateGeneration != mPresentationStateGeneration) {
+            lock.reset();
+            continue;
+        }
+
+        const bool hasPendingReadbackTarget =
+            std::any_of(readbackColorBuffers.begin(), readbackColorBuffers.end(),
+                        [](const ColorBufferPtr& readbackColorBuffer) {
+                            return readbackColorBuffer->hasPendingVulkanCompletion();
+                        });
+        if (hasPendingReadbackTarget) {
+            lock.reset();
+            continue;
+        }
+
+        return lock;
+    }
+}
+
+uint64_t FrameBuffer::Impl::reserveColorBufferPostSequenceLocked(HandleType colorBufferHandle) {
+    if (!colorBufferHandle) {
+        return 0;
+    }
+    return ++mColorBufferPostSequences[colorBufferHandle];
+}
+
+bool FrameBuffer::Impl::isColorBufferPostSequenceCurrentLocked(HandleType colorBufferHandle,
+                                                               uint64_t sequence) const {
+    if (!colorBufferHandle || !sequence) {
+        return false;
+    }
+
+    const auto it = mColorBufferPostSequences.find(colorBufferHandle);
+    return it != mColorBufferPostSequences.end() && it->second == sequence;
+}
+
+void FrameBuffer::Impl::eraseColorBufferPostSequenceLocked(HandleType colorBufferHandle) {
+    if (!colorBufferHandle) {
+        return;
+    }
+    mColorBufferPostSequences.erase(colorBufferHandle);
+}
+
 ColorBufferPtr FrameBuffer::Impl::findColorBuffer(HandleType p_colorbuffer) {
     AutoLock colorBufferMapLock(m_colorBufferMapLock);
     ColorBufferMap::iterator c(m_colorbuffers.find(p_colorbuffer));
@@ -3556,8 +3801,19 @@ int FrameBuffer::Impl::destroyDisplay(uint32_t displayId) {
 }
 
 int FrameBuffer::Impl::setDisplayColorBuffer(uint32_t displayId, uint32_t colorBuffer) {
+    AutoLock lock(m_lock);
+    uint32_t previousColorBuffer = 0;
+    get_gfxstream_multi_display_operations().get_display_color_buffer(displayId,
+                                                                      &previousColorBuffer);
     int ret = get_gfxstream_multi_display_operations().set_display_color_buffer(displayId,
                                                                                 colorBuffer);
+    ++mPresentationStateGeneration;
+    if (previousColorBuffer) {
+        reserveColorBufferPostSequenceLocked(previousColorBuffer);
+    }
+    if (colorBuffer) {
+        reserveColorBufferPostSequenceLocked(colorBuffer);
+    }
     if (isPresentTraceEnabled()) {
         GFXSTREAM_INFO("PRESENT FrameBuffer::setDisplayColorBuffer display=%u colorBuffer=%u ret=%d",
                        displayId, colorBuffer, ret);
@@ -3652,28 +3908,6 @@ std::unique_ptr<BorrowedImageInfo> FrameBuffer::Impl::borrowColorBufferForCompos
     return colorBufferPtr->borrowForComposition(api, colorBufferIsTarget);
 }
 
-std::unique_ptr<BorrowedImageInfo> FrameBuffer::Impl::borrowColorBufferForDisplay(
-    uint32_t colorBufferHandle) {
-    ColorBufferPtr colorBufferPtr = findColorBuffer(colorBufferHandle);
-    if (!colorBufferPtr) {
-        GFXSTREAM_ERROR("Failed to get borrowed image info for ColorBuffer:%d", colorBufferHandle);
-        return nullptr;
-    }
-
-    if (m_useVulkanComposition) {
-        invalidateColorBufferForVk(colorBufferHandle);
-    } else {
-#if GFXSTREAM_ENABLE_HOST_GLES
-        invalidateColorBufferForGl(colorBufferHandle);
-#else
-        GFXSTREAM_ERROR("Failed to invalidate ColorBuffer:%d", colorBufferHandle);
-#endif
-    }
-
-    const auto api = m_useVulkanComposition ? ColorBuffer::UsedApi::kVk : ColorBuffer::UsedApi::kGl;
-    return colorBufferPtr->borrowForDisplay(api);
-}
-
 void FrameBuffer::Impl::logVulkanDeviceLost() {
     if (!m_emulationVk) {
         GFXSTREAM_FATAL("Device lost without VkEmulation?");
@@ -3757,10 +3991,15 @@ int FrameBuffer::Impl::getDisplayActiveConfig() {
 }
 
 bool FrameBuffer::Impl::flushColorBufferFromVk(HandleType colorBufferHandle) {
-    AutoLock mutex(m_lock);
     auto colorBuffer = findColorBuffer(colorBufferHandle);
     if (!colorBuffer) {
         GFXSTREAM_ERROR("%s: Failed to find ColorBuffer:%d", __func__, colorBufferHandle);
+        return false;
+    }
+    auto lock = lockFrameBufferForColorBufferGlUse(colorBuffer);
+    if (!lock) {
+        GFXSTREAM_ERROR("%s: Failed to resolve pending Vulkan completion for ColorBuffer:%d",
+                        __func__, colorBufferHandle);
         return false;
     }
     return colorBuffer->flushFromVk();
@@ -4173,7 +4412,10 @@ void FrameBuffer::Impl::createEmulatedEglFenceSync(EGLenum type, int destroyWhen
             uint32_t syncSurface;
             createTrivialContext(0,  // There is no context to share.
                                 &syncContext, &syncSurface);
-            bindContext(syncContext, syncSurface, syncSurface);
+            if (!bindContext(syncContext, syncSurface, syncSurface)) {
+                GFXSTREAM_ERROR("Failed to bind trivial context for egl fence creation.");
+                return;
+            }
             // This context is then cleaned up when the render thread exits.
         }
 
@@ -4523,11 +4765,16 @@ ContextHelper* FrameBuffer::Impl::getPbufferSurfaceContextHelper() const {
 }
 
 bool FrameBuffer::Impl::bindColorBufferToTexture(HandleType p_colorbuffer) {
-    AutoLock mutex(m_lock);
-
     ColorBufferPtr colorBuffer = findColorBuffer(p_colorbuffer);
     if (!colorBuffer) {
         // bad colorbuffer handle
+        return false;
+    }
+
+    auto lock = lockFrameBufferForColorBufferGlUse(colorBuffer);
+    if (!lock) {
+        GFXSTREAM_ERROR("Failed to resolve pending Vulkan completion for ColorBuffer:%d",
+                        p_colorbuffer);
         return false;
     }
 
@@ -4537,14 +4784,24 @@ bool FrameBuffer::Impl::bindColorBufferToTexture(HandleType p_colorbuffer) {
 bool FrameBuffer::Impl::bindColorBufferToTexture2(HandleType p_colorbuffer) {
     // This is only called when using multi window display
     // It will deadlock when posting from main thread.
-    std::unique_ptr<AutoLock> mutex;
-    if (!postOnlyOnMainThread()) {
-        mutex = std::make_unique<AutoLock>(m_lock);
-    }
-
     ColorBufferPtr colorBuffer = findColorBuffer(p_colorbuffer);
     if (!colorBuffer) {
         // bad colorbuffer handle
+        return false;
+    }
+
+    std::optional<AutoLock> lock;
+    if (!postOnlyOnMainThread()) {
+        auto acquiredLock = lockFrameBufferForColorBufferGlUse(colorBuffer);
+        if (!acquiredLock) {
+            GFXSTREAM_ERROR("Failed to resolve pending Vulkan completion for ColorBuffer:%d",
+                            p_colorbuffer);
+            return false;
+        }
+        lock.emplace(std::move(*acquiredLock));
+    } else if (!colorBuffer->waitForPendingVulkanCompletion()) {
+        GFXSTREAM_ERROR("Failed to resolve pending Vulkan completion for ColorBuffer:%d",
+                        p_colorbuffer);
         return false;
     }
 
@@ -4552,11 +4809,16 @@ bool FrameBuffer::Impl::bindColorBufferToTexture2(HandleType p_colorbuffer) {
 }
 
 bool FrameBuffer::Impl::bindColorBufferToRenderbuffer(HandleType p_colorbuffer) {
-    AutoLock mutex(m_lock);
-
     ColorBufferPtr colorBuffer = findColorBuffer(p_colorbuffer);
     if (!colorBuffer) {
         // bad colorbuffer handle
+        return false;
+    }
+
+    auto lock = lockFrameBufferForColorBufferGlUse(colorBuffer);
+    if (!lock) {
+        GFXSTREAM_ERROR("Failed to resolve pending Vulkan completion for ColorBuffer:%d",
+                        p_colorbuffer);
         return false;
     }
 
@@ -4766,14 +5028,17 @@ void FrameBuffer::Impl::swapTexturesAndUpdateColorBuffer(uint32_t p_colorbuffer,
 
 bool FrameBuffer::Impl::readColorBufferContents(HandleType p_colorbuffer, size_t* numBytes,
                                                 void* pixels) {
-    AutoLock mutex(m_lock);
-
     ColorBufferPtr colorBuffer = findColorBuffer(p_colorbuffer);
     if (!colorBuffer) {
         // bad colorbuffer handle
         return false;
     }
 
+    auto lock = lockFrameBufferForColorBufferGlUse(colorBuffer);
+    if (!lock) {
+        GFXSTREAM_FATAL("Failed to resolve pending Vulkan completion for ColorBuffer:%d",
+                        p_colorbuffer);
+    }
     return colorBuffer->glOpReadContents(numBytes, pixels);
 }
 
@@ -5180,11 +5445,6 @@ void FrameBuffer::setGuestManagedColorBufferLifetime(bool guestManaged) {
 std::unique_ptr<BorrowedImageInfo> FrameBuffer::borrowColorBufferForComposition(
     uint32_t colorBufferHandle, bool colorBufferIsTarget) {
     return mImpl->borrowColorBufferForComposition(colorBufferHandle, colorBufferIsTarget);
-}
-
-std::unique_ptr<BorrowedImageInfo> FrameBuffer::borrowColorBufferForDisplay(
-    uint32_t colorBufferHandle) {
-    return mImpl->borrowColorBufferForDisplay(colorBufferHandle);
 }
 
 void FrameBuffer::setVsyncHz(int vsyncHz) { mImpl->setVsyncHz(vsyncHz); }

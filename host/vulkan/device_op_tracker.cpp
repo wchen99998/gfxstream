@@ -68,28 +68,43 @@ void DeviceOpTracker::AddPendingGarbage(DeviceOpWaitable waitable, VkSemaphore s
 }
 
 void DeviceOpTracker::PollAndProcessGarbage() {
-    std::lock_guard<std::mutex> pollFunctionsLock(mPollFunctionsMutex);
-    mPollFunctions.erase(std::remove_if(mPollFunctions.begin(), mPollFunctions.end(),
-                                        [](const PollFunction& pollingFunc) {
-                                            DeviceOpStatus status = pollingFunc.func();
-                                            return status != DeviceOpStatus::kPending;
-                                        }),
-                         mPollFunctions.end());
+    std::deque<PollFunction> pollFunctions;
+    {
+        std::lock_guard<std::mutex> pollFunctionsLock(mPollFunctionsMutex);
+        pollFunctions.swap(mPollFunctions);
+    }
 
-    if (mPollFunctions.size() > kSizeLoggingThreshold) {
-        // Only report old-enough objects to avoid reporting lots of pending waitables
-        // when many requests have been done in a small amount of time.
-        const auto now = std::chrono::system_clock::now();
-        const auto old = now - kSizeLoggingTimeThreshold;
-        size_t numOldFuncs = std::count_if(
-            mPollFunctions.begin(), mPollFunctions.end(), [old](const PollFunction& pollingFunc) {
-                return (pollingFunc.timepoint < old);
-            });
-        if (numOldFuncs > kSizeLoggingThreshold) {
-            GFXSTREAM_WARNING(
-                "VkDevice:%p has %d pending waitables, %d taking more than %d milliseconds.",
-                mDevice, mPollFunctions.size(), numOldFuncs,
-                std::chrono::duration_cast<std::chrono::milliseconds>(kSizeLoggingTimeThreshold));
+    std::deque<PollFunction> pendingPollFunctions;
+    for (auto& pollFunction : pollFunctions) {
+        const DeviceOpStatus status = pollFunction.func();
+        if (status == DeviceOpStatus::kPending) {
+            pendingPollFunctions.emplace_back(std::move(pollFunction));
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> pollFunctionsLock(mPollFunctionsMutex);
+        mPollFunctions.insert(
+            mPollFunctions.begin(), std::make_move_iterator(pendingPollFunctions.begin()),
+            std::make_move_iterator(pendingPollFunctions.end()));
+
+        if (mPollFunctions.size() > kSizeLoggingThreshold) {
+            // Only report old-enough objects to avoid reporting lots of pending waitables
+            // when many requests have been done in a small amount of time.
+            const auto now = std::chrono::system_clock::now();
+            const auto old = now - kSizeLoggingTimeThreshold;
+            size_t numOldFuncs =
+                std::count_if(mPollFunctions.begin(), mPollFunctions.end(),
+                              [old](const PollFunction& pollingFunc) {
+                                  return pollingFunc.timepoint < old;
+                              });
+            if (numOldFuncs > kSizeLoggingThreshold) {
+                GFXSTREAM_WARNING(
+                    "VkDevice:%p has %d pending waitables, %d taking more than %d milliseconds.",
+                    mDevice, mPollFunctions.size(), numOldFuncs,
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        kSizeLoggingTimeThreshold));
+            }
         }
     }
 
@@ -182,7 +197,7 @@ void DeviceOpTracker::AddPendingDeviceOp(std::function<DeviceOpStatus()> pollFun
 DeviceOpBuilder::DeviceOpBuilder(DeviceOpTracker& tracker) : mTracker(tracker) {}
 
 DeviceOpBuilder::~DeviceOpBuilder() {
-    if (!mSubmittedFence) {
+    if (!mSubmissionHandled) {
         GFXSTREAM_FATAL("Invalid usage: failed to call OnQueueSubmittedWithFence().");
     }
 }
@@ -206,22 +221,34 @@ VkFence DeviceOpBuilder::CreateFenceForOp() {
 }
 
 DeviceOpWaitable DeviceOpBuilder::OnQueueSubmittedWithFence(VkFence fence) {
+    return OnQueueSubmittedWithFence(fence, {});
+}
+
+DeviceOpWaitable DeviceOpBuilder::OnQueueSubmittedWithFence(VkFence fence,
+                                                            std::function<void()> onSuccess) {
     if (mCreatedFence.has_value() && fence != mCreatedFence) {
         GFXSTREAM_FATAL(
             "Invalid usage: failed to call OnQueueSubmittedWithFence() with the fence "
             "requested from CreateFenceForOp.");
     }
     mSubmittedFence = fence;
+    mSubmissionHandled = true;
 
     const bool destroyFenceOnCompletion = mCreatedFence.has_value();
 
-    std::shared_ptr<std::promise<void>> promise = std::make_shared<std::promise<void>>();
+    std::shared_ptr<std::promise<DeviceOpStatus>> promise =
+        std::make_shared<std::promise<DeviceOpStatus>>();
     DeviceOpWaitable future = promise->get_future().share();
 
     mTracker.AddPendingDeviceOp([device = mTracker.mDevice,
                                  deviceDispatch = mTracker.mDeviceDispatch, fence,
-                                 promise = std::move(promise), destroyFenceOnCompletion] {
+                                 promise = std::move(promise), destroyFenceOnCompletion,
+                                 onSuccess = std::move(onSuccess)]() mutable {
         if (fence == VK_NULL_HANDLE) {
+            promise->set_value(DeviceOpStatus::kDone);
+            if (onSuccess) {
+                onSuccess();
+            }
             return DeviceOpStatus::kDone;
         }
 
@@ -233,12 +260,26 @@ DeviceOpWaitable DeviceOpBuilder::OnQueueSubmittedWithFence(VkFence fence) {
         if (destroyFenceOnCompletion) {
             deviceDispatch->vkDestroyFence(device, fence, nullptr);
         }
-        promise->set_value();
+        const DeviceOpStatus status =
+            result == VK_SUCCESS ? DeviceOpStatus::kDone : DeviceOpStatus::kFailure;
+        promise->set_value(status);
+        if (status == DeviceOpStatus::kDone && onSuccess) {
+            onSuccess();
+        }
 
-        return result == VK_SUCCESS ? DeviceOpStatus::kDone : DeviceOpStatus::kFailure;
+        return status;
     });
 
     return future;
+}
+
+void DeviceOpBuilder::MarkSubmissionFailed() {
+    if (mCreatedFence.has_value() && *mCreatedFence != VK_NULL_HANDLE) {
+        mTracker.mDeviceDispatch->vkDestroyFence(mTracker.mDevice, *mCreatedFence, nullptr);
+    }
+    mCreatedFence.reset();
+    mSubmittedFence = std::nullopt;
+    mSubmissionHandled = true;
 }
 
 }  // namespace vk

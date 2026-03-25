@@ -92,11 +92,12 @@ void PostWorker::block(std::promise<void> scheduledSignal, std::future<void> con
 
 PostWorker::~PostWorker() {}
 
-void PostWorker::post(ColorBuffer* cb, std::unique_ptr<Post::CompletionCallback> postCallback,
-              const std::optional<std::array<float, 16>>& colorTransform) {
+void PostWorker::post(std::shared_ptr<ColorBuffer> cb,
+                      std::unique_ptr<Post::CompletionCallback> postCallback,
+                      const std::optional<std::array<float, 16>>& colorTransform) {
     auto packagedPostCallback = std::shared_ptr<Post::CompletionCallback>(std::move(postCallback));
-    runTask(
-        std::packaged_task<void()>([cb, packagedPostCallback, this, colorTransform] {
+    runTask(std::packaged_task<void()>(
+        [cb = std::move(cb), packagedPostCallback, this, colorTransform] {
             auto completedFuture = postImpl(cb, colorTransform);
             (*packagedPostCallback)(completedFuture);
         }));
@@ -135,9 +136,22 @@ void PostWorker::screenshot(ColorBuffer* cb, int screenwidth, int screenheight, 
                             GfxstreamFormat pixelsFormat, void* outPixels, const Rect& rect,
                             const std::optional<std::array<float, 16>>& colorTransform) {
     // See b/292237104.
-    mFb->lock();
-    cb->readToBytesScaled(screenwidth, screenheight, skinRotation, rect, pixelsFormat, outPixels, colorTransform);
-    mFb->unlock();
+    while (true) {
+        if (!cb->waitForPendingVulkanCompletion()) {
+            GFXSTREAM_FATAL("Failed to resolve pending Vulkan completion for screenshot.");
+        }
+
+        mFb->lock();
+        if (cb->hasPendingVulkanCompletion()) {
+            mFb->unlock();
+            continue;
+        }
+
+        cb->readToBytesScaled(screenwidth, screenheight, skinRotation, rect, pixelsFormat,
+                              outPixels, colorTransform);
+        mFb->unlock();
+        return;
+    }
 }
 
 namespace {

@@ -20,6 +20,8 @@
 #include <gtest/gtest.h>
 #include <vulkan/vulkan_core.h>
 
+#include "borrowed_image_vk.h"
+
 namespace gfxstream {
 namespace host {
 namespace vk {
@@ -41,6 +43,8 @@ using ::testing::MockFunction;
 using ::testing::Return;
 using ::testing::StrEq;
 using ::testing::StrNe;
+using ::testing::IsEmpty;
+using ::testing::SizeIs;
 
 TEST(getVkInstanceProcAddrWithFallbackTest, ShouldReturnNullOnFailure) {
     VkInstance instance = reinterpret_cast<VkInstance>(0x1234'0000);
@@ -287,6 +291,140 @@ TEST(vk_util, vk_insert_struct) {
     ASSERT_EQ(base, reinterpret_cast<VkBaseInStructure*>(&physicalDeviceFeature));
     base = base->pNext;
     ASSERT_EQ(base, nullptr);
+}
+
+TEST(BorrowedImageVkTest, PreserveContentsNormalizesUndefinedLayout) {
+    BorrowedImageInfoVk borrowedImageInfo = {};
+    borrowedImageInfo.image = reinterpret_cast<VkImage>(0x1234);
+    borrowedImageInfo.preBorrowLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    borrowedImageInfo.preBorrowQueueFamilyIndex = 3;
+    borrowedImageInfo.postBorrowLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    borrowedImageInfo.postBorrowQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+
+    std::vector<VkImageMemoryBarrier> preUseQueueTransferBarriers;
+    std::vector<VkImageMemoryBarrier> preUseLayoutTransitionBarriers;
+    std::vector<VkImageMemoryBarrier> postUseLayoutTransitionBarriers;
+    std::vector<VkImageMemoryBarrier> postUseQueueTransferBarriers;
+    addNeededBarriersToUseBorrowedImage(
+        borrowedImageInfo,
+        /*usedQueueFamilyIndex=*/5,
+        /*usedInitialImageLayout=*/VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        /*usedFinalImageLayout=*/VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_ACCESS_TRANSFER_READ_BIT, BorrowedImageLayoutSemantics::kPreserveContents,
+        &preUseQueueTransferBarriers, &preUseLayoutTransitionBarriers,
+        &postUseLayoutTransitionBarriers, &postUseQueueTransferBarriers);
+
+    ASSERT_THAT(preUseQueueTransferBarriers, SizeIs(1));
+    EXPECT_EQ(preUseQueueTransferBarriers[0].oldLayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    EXPECT_EQ(preUseQueueTransferBarriers[0].newLayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    EXPECT_THAT(preUseLayoutTransitionBarriers, IsEmpty());
+
+    ASSERT_THAT(postUseLayoutTransitionBarriers, SizeIs(1));
+    EXPECT_EQ(postUseLayoutTransitionBarriers[0].oldLayout,
+              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    EXPECT_EQ(postUseLayoutTransitionBarriers[0].newLayout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+
+    ASSERT_THAT(postUseQueueTransferBarriers, SizeIs(1));
+    EXPECT_EQ(postUseQueueTransferBarriers[0].oldLayout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    EXPECT_EQ(postUseQueueTransferBarriers[0].newLayout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+}
+
+TEST(BorrowedImageVkTest, DisplayLeaseAcquireTransitionsIntoDisplayOwnershipOnce) {
+    BorrowedImageInfoVk borrowedImageInfo = {};
+    borrowedImageInfo.image = reinterpret_cast<VkImage>(0x5678);
+    borrowedImageInfo.preBorrowLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    borrowedImageInfo.preBorrowQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+    borrowedImageInfo.postBorrowLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    borrowedImageInfo.postBorrowQueueFamilyIndex = 5;
+
+    std::vector<VkImageMemoryBarrier> preUseQueueTransferBarriers;
+    std::vector<VkImageMemoryBarrier> preUseLayoutTransitionBarriers;
+    std::vector<VkImageMemoryBarrier> postUseLayoutTransitionBarriers;
+    std::vector<VkImageMemoryBarrier> postUseQueueTransferBarriers;
+    addNeededBarriersToUseBorrowedImage(
+        borrowedImageInfo,
+        /*usedQueueFamilyIndex=*/5,
+        /*usedInitialImageLayout=*/VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        /*usedFinalImageLayout=*/VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_ACCESS_TRANSFER_READ_BIT, BorrowedImageLayoutSemantics::kPreserveContents,
+        &preUseQueueTransferBarriers, &preUseLayoutTransitionBarriers,
+        &postUseLayoutTransitionBarriers, &postUseQueueTransferBarriers);
+
+    ASSERT_THAT(preUseQueueTransferBarriers, SizeIs(1));
+    EXPECT_EQ(preUseQueueTransferBarriers[0].oldLayout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    EXPECT_EQ(preUseQueueTransferBarriers[0].newLayout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+
+    ASSERT_THAT(preUseLayoutTransitionBarriers, SizeIs(1));
+    EXPECT_EQ(preUseLayoutTransitionBarriers[0].oldLayout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    EXPECT_EQ(preUseLayoutTransitionBarriers[0].newLayout,
+              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+    EXPECT_THAT(postUseLayoutTransitionBarriers, IsEmpty());
+    EXPECT_THAT(postUseQueueTransferBarriers, IsEmpty());
+}
+
+TEST(BorrowedImageVkTest, DisplayLeaseReleaseTransitionsBackToGuestOwnership) {
+    BorrowedImageInfoVk borrowedImageInfo = {};
+    borrowedImageInfo.image = reinterpret_cast<VkImage>(0x8765);
+    borrowedImageInfo.preBorrowLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    borrowedImageInfo.preBorrowQueueFamilyIndex = 5;
+    borrowedImageInfo.postBorrowLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    borrowedImageInfo.postBorrowQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+
+    std::vector<VkImageMemoryBarrier> preUseQueueTransferBarriers;
+    std::vector<VkImageMemoryBarrier> preUseLayoutTransitionBarriers;
+    std::vector<VkImageMemoryBarrier> postUseLayoutTransitionBarriers;
+    std::vector<VkImageMemoryBarrier> postUseQueueTransferBarriers;
+    addNeededBarriersToUseBorrowedImage(
+        borrowedImageInfo,
+        /*usedQueueFamilyIndex=*/5,
+        /*usedInitialImageLayout=*/VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        /*usedFinalImageLayout=*/VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_ACCESS_TRANSFER_READ_BIT, BorrowedImageLayoutSemantics::kPreserveContents,
+        &preUseQueueTransferBarriers, &preUseLayoutTransitionBarriers,
+        &postUseLayoutTransitionBarriers, &postUseQueueTransferBarriers);
+
+    EXPECT_THAT(preUseQueueTransferBarriers, IsEmpty());
+    EXPECT_THAT(preUseLayoutTransitionBarriers, IsEmpty());
+
+    ASSERT_THAT(postUseLayoutTransitionBarriers, SizeIs(1));
+    EXPECT_EQ(postUseLayoutTransitionBarriers[0].oldLayout,
+              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    EXPECT_EQ(postUseLayoutTransitionBarriers[0].newLayout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+
+    ASSERT_THAT(postUseQueueTransferBarriers, SizeIs(1));
+    EXPECT_EQ(postUseQueueTransferBarriers[0].oldLayout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    EXPECT_EQ(postUseQueueTransferBarriers[0].newLayout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+}
+
+TEST(BorrowedImageVkTest, MayDiscardContentsKeepsUndefinedTransition) {
+    BorrowedImageInfoVk borrowedImageInfo = {};
+    borrowedImageInfo.image = reinterpret_cast<VkImage>(0x4321);
+    borrowedImageInfo.preBorrowLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    borrowedImageInfo.preBorrowQueueFamilyIndex = 5;
+    borrowedImageInfo.postBorrowLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    borrowedImageInfo.postBorrowQueueFamilyIndex = 5;
+
+    std::vector<VkImageMemoryBarrier> preUseQueueTransferBarriers;
+    std::vector<VkImageMemoryBarrier> preUseLayoutTransitionBarriers;
+    std::vector<VkImageMemoryBarrier> postUseLayoutTransitionBarriers;
+    std::vector<VkImageMemoryBarrier> postUseQueueTransferBarriers;
+    addNeededBarriersToUseBorrowedImage(
+        borrowedImageInfo,
+        /*usedQueueFamilyIndex=*/5,
+        /*usedInitialImageLayout=*/VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        /*usedFinalImageLayout=*/VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_ACCESS_TRANSFER_WRITE_BIT, BorrowedImageLayoutSemantics::kMayDiscardContents,
+        &preUseQueueTransferBarriers, &preUseLayoutTransitionBarriers,
+        &postUseLayoutTransitionBarriers, &postUseQueueTransferBarriers);
+
+    EXPECT_THAT(preUseQueueTransferBarriers, IsEmpty());
+    ASSERT_THAT(preUseLayoutTransitionBarriers, SizeIs(1));
+    EXPECT_EQ(preUseLayoutTransitionBarriers[0].oldLayout, VK_IMAGE_LAYOUT_UNDEFINED);
+    EXPECT_EQ(preUseLayoutTransitionBarriers[0].newLayout,
+              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    EXPECT_THAT(postUseLayoutTransitionBarriers, IsEmpty());
+    EXPECT_THAT(postUseQueueTransferBarriers, IsEmpty());
 }
 
 }  // namespace

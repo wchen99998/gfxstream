@@ -56,12 +56,23 @@ struct BorrowedImageInfoVk : public BorrowedImageInfo {
     uint32_t postBorrowQueueFamilyIndex = 0;
 };
 
+// Some borrowed images are tracked with `VK_IMAGE_LAYOUT_UNDEFINED` when the
+// host does not know the real guest-visible layout. Callers that need to
+// preserve the existing contents must opt into normalizing that case to the
+// layout they intend to use, instead of emitting a destructive
+// `VK_IMAGE_LAYOUT_UNDEFINED` transition.
+enum class BorrowedImageLayoutSemantics {
+    kPreserveContents,
+    kMayDiscardContents,
+};
+
 // The caller should always record the queue transfer barriers with stages that supoort
 // VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT.
 void addNeededBarriersToUseBorrowedImage(
     const BorrowedImageInfoVk& borrowedImageInfo, uint32_t usedQueueFamilyIndex,
     VkImageLayout usedInitialImageLayout, VkImageLayout usedFinalImageLayout,
-    VkAccessFlags usedAccessMask, std::vector<VkImageMemoryBarrier>* preUseQueueTransferBarriers,
+    VkAccessFlags usedAccessMask, BorrowedImageLayoutSemantics layoutSemantics,
+    std::vector<VkImageMemoryBarrier>* preUseQueueTransferBarriers,
     std::vector<VkImageMemoryBarrier>* preUseLayoutTransitionBarriers,
     std::vector<VkImageMemoryBarrier>* postUseLayoutTransitionBarriers,
     std::vector<VkImageMemoryBarrier>* postUseQueueTransferBarriers);

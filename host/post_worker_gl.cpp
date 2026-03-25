@@ -54,13 +54,18 @@ PostWorkerGl::PostWorkerGl(bool mainThreadPostingOnly, FrameBuffer* fb, Composit
 }
 
 std::shared_future<void> PostWorkerGl::postImpl(
-    ColorBuffer* cb, const std::optional<std::array<float, 16>>& colorTransform) {
+    const std::shared_ptr<ColorBuffer>& cb,
+    const std::optional<std::array<float, 16>>& colorTransform) {
     if (!mContextBound || m_mainThreadPostingOnly) {
         // This might happen on headless mode
         // Also if posting on main thread, the context binding can get polluted easily, which
         // requires frequent rebinds.
         setupContext();
     }
+    if (!cb) {
+        GFXSTREAM_FATAL("PostWorkerGl missing ColorBuffer.");
+    }
+    ColorBuffer* const colorBuffer = cb.get();
     DisplayGl::Post post = {};
 
     ComposeLayer postLayerOptions = {
@@ -77,7 +82,7 @@ std::shared_future<void> PostWorkerGl::postImpl(
         if (get_gfxstream_should_skip_draw()) {
             post.layers.clear();
         } else {
-            post.layers.push_back(postWithOverlay(cb, colorTransform));
+            post.layers.push_back(postWithOverlay(colorBuffer, colorTransform));
         }
 #endif
     } else if (multiDisplay.is_multi_display_enabled()) {
@@ -101,7 +106,7 @@ std::shared_future<void> PostWorkerGl::postImpl(
                 get_gfxstream_window_operations().paint_multi_display_window(
                     currentDisplayId, currentDisplayColorBufferHandle);
             }
-            post.layers.push_back(postWithOverlay(cb, colorTransform));
+            post.layers.push_back(postWithOverlay(colorBuffer, colorTransform));
         } else {
             uint32_t combinedDisplayW = 0;
             uint32_t combinedDisplayH = 0;
@@ -132,7 +137,7 @@ std::shared_future<void> PostWorkerGl::postImpl(
 
                 ColorBuffer* currentCb =
                     currentDisplayId == 0
-                        ? cb
+                        ? colorBuffer
                         : mFb->findColorBuffer(currentDisplayColorBufferHandle).get();
                 if (!currentCb) {
                     continue;
@@ -191,11 +196,11 @@ std::shared_future<void> PostWorkerGl::postImpl(
         postLayerOptions.transform = getTransformFromRotation(mFb->getZrot());
 
         post.layers.push_back(DisplayGl::PostLayer{
-            .colorBuffer = cb,
+            .colorBuffer = colorBuffer,
             .layerOptions = postLayerOptions,
         });
     } else {
-        post.layers.push_back(postWithOverlay(cb, colorTransform));
+        post.layers.push_back(postWithOverlay(colorBuffer, colorTransform));
     }
     return m_displayGl->post(post);
 }
