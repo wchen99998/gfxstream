@@ -46,6 +46,11 @@ struct BackendCallbacks {
                            std::shared_ptr<std::atomic<bool>> completionSucceeded)>;
     SetColorBufferPendingVulkanCompletionFunc setColorBufferPendingVulkanCompletion;
 
+    using ResolveCompletedColorBufferVulkanCompletionsFunc =
+        std::function<void(uint32_t colorBufferHandle)>;
+    ResolveCompletedColorBufferVulkanCompletionsFunc
+        resolveCompletedColorBufferVulkanCompletions;
+
     using ScheduleAsyncWorkFunc =
         std::function<CancelableFuture(std::function<void()> work, std::string description)>;
     ScheduleAsyncWorkFunc scheduleAsyncWork;

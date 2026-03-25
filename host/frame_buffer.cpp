@@ -1196,8 +1196,24 @@ std::unique_ptr<FrameBuffer::Impl> FrameBuffer::Impl::Create(FrameBuffer* frameb
                     colorBuffer->setPendingVulkanCompletion(std::move(completionFuture),
                                                             std::move(completionSucceeded));
                 },
+            .resolveCompletedColorBufferVulkanCompletions =
+                [impl = impl.get()](uint32_t colorBufferHandle) {
+                    ColorBufferPtr colorBuffer;
+                    {
+                        AutoLock mutex(impl->m_lock);
+                        colorBuffer = impl->findColorBuffer(colorBufferHandle);
+                    }
+                    if (!colorBuffer) {
+                        return;
+                    }
+                    if (!colorBuffer->resolveCompletedPendingVulkanCompletions()) {
+                        GFXSTREAM_ERROR(
+                            "Failed to resolve completed Vulkan completions for ColorBuffer:%d",
+                            colorBufferHandle);
+                    }
+                },
             .scheduleAsyncWork =
-                [impl = impl.get()](std::function<void()> work, std::string description) {
+                [](std::function<void()> work, std::string description) {
                     auto promise = std::make_shared<AutoCancelingPromise>();
                     auto future = promise->GetFuture();
                     SyncThread::get()->triggerGeneral(

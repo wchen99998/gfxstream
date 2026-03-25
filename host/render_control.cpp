@@ -330,9 +330,8 @@ static EGLint rcQueryEGLString(EGLenum name, void* buffer, EGLint bufferSize)
 }
 
 static bool shouldEnableAsyncSwap(const gfxstream::host::FeatureSet& features) {
-     return features.GlAsyncSwap.enabled &&
-            !features.VulkanNativeSwapchain.enabled &&
-           gfxstream_sync_device_exists() &&
+    return features.GlAsyncSwap.enabled && !features.GuestVulkanOnly.enabled &&
+           !features.VulkanNativeSwapchain.enabled && gfxstream_sync_device_exists() &&
            sizeof(void*) == 8;
 }
 
@@ -1162,8 +1161,9 @@ static void rcCreateSyncKHR(EGLenum type,
                                    outSyncThread);
 
     RenderThreadInfo* tInfo = RenderThreadInfo::get();
-    if (fb->hasEmulationGl() && tInfo && outSync && shouldEnableVsyncGatedSyncFences(fb->getFeatures())) {
-        auto fenceSync = reinterpret_cast<EmulatedEglFenceSync*>(outSync);
+    if (fb->hasEmulationGl() && tInfo && outSync && *outSync &&
+        shouldEnableVsyncGatedSyncFences(fb->getFeatures())) {
+        auto fenceSync = reinterpret_cast<EmulatedEglFenceSync*>(*outSync);
         fenceSync->setIsCompositionFence(tInfo->m_isCompositionThread);
     }
 }
