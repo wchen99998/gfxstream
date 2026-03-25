@@ -28,10 +28,12 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <variant>
 
 #include "debug_utils_helper.h"
 #include "device_op_tracker.h"
 #include "handle.h"
+#include "gfxstream/CancelableFuture.h"
 #include "vk_emulated_physical_device_memory.h"
 #include "vk_emulated_physical_device_queue.h"
 #include "render-utils/stream.h"
@@ -313,13 +315,26 @@ struct PhysicalQueuePendingOps {
     std::vector<std::unique_ptr<DeferredSubmitCall>> mSubmitCalls;
 };
 
+struct QueueTrackedWork {
+    using Waitable =
+        std::variant<std::monostate, DeviceOpWaitable, gfxstream::CancelableFuture>;
+
+    QueueTrackedWork() = default;
+    explicit QueueTrackedWork(const DeviceOpWaitable& waitable) : waitable(waitable) {}
+    explicit QueueTrackedWork(const gfxstream::CancelableFuture& waitable) : waitable(waitable) {}
+
+    Waitable waitable;
+};
+
 struct QueueInfo {
     std::shared_ptr<std::mutex> queueMutex;
     std::shared_ptr<PhysicalQueuePendingOps> pendingOps;  // Only used if virtually shared
     VkDevice device;
+    VkQueue dispatchQueue = VK_NULL_HANDLE;
     uint32_t queueFamilyIndex;
     VkQueue boxed = nullptr;
     bool usingSharedPhysicalQueue = false;
+    std::optional<QueueTrackedWork> latestTrackedWork;
 
     // In order to create a virtual queue handle, we use an offset to the physical
     // queue handle value. This assumes the new generated virtual handle value will

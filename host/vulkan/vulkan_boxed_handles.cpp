@@ -669,6 +669,19 @@ VkQueue try_unbox_VkQueue(VkQueue boxed) {
     return try_unbox_VkType<VkQueue>(boxed);
 }
 
+VkQueue underlying_VkQueue(VkQueue boxed) {
+    if (boxed == VK_NULL_HANDLE) {
+        return VK_NULL_HANDLE;
+    }
+
+    BoxedHandleInfo* info = sBoxedHandleManager.get((uint64_t)(uintptr_t)boxed);
+    if (!info) {
+        return VK_NULL_HANDLE;
+    }
+
+    return reinterpret_cast<VkQueue>(info->underlying);
+}
+
 VkQueue unboxed_to_boxed_VkQueue(VkQueue unboxed) {
     return unboxed_to_boxed_non_dispatchable_VkType<VkQueue>(unboxed);
 }

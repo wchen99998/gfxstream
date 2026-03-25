@@ -76,7 +76,9 @@ class AndroidNativeBufferInfo {
                                                  VkQueue queue, std::mutex* queueMutex,
                                                  uint32_t waitSemaphoreCount,
                                                  const VkSemaphore* pWaitSemaphores,
-                                                 int* pNativeFenceFd);
+                                                 int* pNativeFenceFd,
+                                                 std::optional<gfxstream::CancelableFuture>*
+                                                     pCompletionWaitable = nullptr);
 
     AsyncResult registerQsriCallback(VkImage image, VkQsriTimeline::Callback callback);
 

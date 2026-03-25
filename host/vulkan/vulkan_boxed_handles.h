@@ -155,6 +155,10 @@ extern BoxedHandleManager sBoxedHandleManager;
 GOLDFISH_VK_LIST_DISPATCHABLE_HANDLE_TYPES(DEFINE_BOXED_DISPATCHABLE_HANDLE_API_DECL)
 GOLDFISH_VK_LIST_NON_DISPATCHABLE_HANDLE_TYPES(DEFINE_BOXED_NON_DISPATCHABLE_HANDLE_API_DECL)
 
+// Returns the exact queue handle stored in the boxed-handle table, preserving
+// any virtual-queue tag bits used for guest-side bookkeeping.
+VkQueue underlying_VkQueue(VkQueue boxed);
+
 }  // namespace vk
 }  // namespace host
 }  // namespace gfxstream

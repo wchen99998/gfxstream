@@ -262,6 +262,41 @@ class VkDecoderGlobalState::Impl {
 
     const gfxstream::host::FeatureSet& getFeatures() const { return m_vkEmulation->getFeatures(); }
 
+    static bool hasTrackedQueueWork(const std::optional<QueueTrackedWork>& trackedWork) {
+        return trackedWork.has_value() &&
+               !std::holds_alternative<std::monostate>(trackedWork->waitable);
+    }
+
+    static VkResult waitForTrackedQueueWork(const QueueTrackedWork& trackedWork,
+                                            const DeviceOpTrackerPtr& deviceOpTracker) {
+        return std::visit(
+            [&](const auto& waitable) -> VkResult {
+                using T = std::decay_t<decltype(waitable)>;
+                if constexpr (std::is_same_v<T, std::monostate>) {
+                    return VK_SUCCESS;
+                } else if constexpr (std::is_same_v<T, DeviceOpWaitable>) {
+                    if (!deviceOpTracker) {
+                        return VK_ERROR_DEVICE_LOST;
+                    }
+                    while (!IsDone(waitable)) {
+                        deviceOpTracker->PollAndProcessGarbage();
+                        std::this_thread::yield();
+                    }
+                    return GetStatus(waitable) == DeviceOpStatus::kDone ? VK_SUCCESS
+                                                                        : VK_ERROR_DEVICE_LOST;
+                } else if constexpr (std::is_same_v<T, gfxstream::CancelableFuture>) {
+                    if (!waitable.valid()) {
+                        return VK_SUCCESS;
+                    }
+                    waitable.wait();
+                    return waitable.get() == gfxstream::CancelableFutureStatus::kSuccess
+                               ? VK_SUCCESS
+                               : VK_ERROR_DEVICE_LOST;
+                }
+            },
+            trackedWork.waitable);
+    }
+
     void loadEvents(gfxstream::Stream* stream) REQUIRES(mMutex) {
         const uint32_t sz = stream->getBe32();
 
@@ -2360,6 +2395,7 @@ class VkDecoderGlobalState::Impl {
                 VALIDATE_NEW_HANDLE_INFO_ENTRY(mQueueInfo, physicalQueue);
                 QueueInfo& physicalQueueInfo = mQueueInfo[physicalQueue];
                 physicalQueueInfo.device = *pDevice;
+                physicalQueueInfo.dispatchQueue = physicalQueue;
                 physicalQueueInfo.queueFamilyIndex = index;
                 physicalQueueInfo.boxed = boxedQueue;
                 physicalQueueInfo.queueMutex = std::make_shared<std::mutex>();
@@ -2399,10 +2435,12 @@ class VkDecoderGlobalState::Impl {
                         VALIDATE_NEW_HANDLE_INFO_ENTRY(mQueueInfo, virtualQueue);
                         QueueInfo& virtualQueueInfo = mQueueInfo[virtualQueue];
                         virtualQueueInfo.device = physicalQueueInfo.device;
+                        virtualQueueInfo.dispatchQueue = physicalQueue;
                         virtualQueueInfo.queueFamilyIndex = physicalQueueInfo.queueFamilyIndex;
                         virtualQueueInfo.boxed = boxedVirtualQueue;
                         virtualQueueInfo.queueMutex = physicalQueueInfo.queueMutex;  // Shares the same lock!
                         virtualQueueInfo.pendingOps = physicalQueueInfo.pendingOps;  // Shares the same pendingOps!
+                        virtualQueueInfo.usingSharedPhysicalQueue = true;
                         physicalQueueInfo.usingSharedPhysicalQueue = true;
                         queues.push_back(virtualQueue);
                     }
@@ -3940,6 +3978,7 @@ class VkDecoderGlobalState::Impl {
                 return VK_SUCCESS;
             }
 
+            std::unordered_set<VkQueue> seenDispatchQueues;
             for (auto queue_iter : deviceInfo->queues) {
                 for (auto& unboxed_queue : queue_iter.second) {
                     auto queueInfo = gfxstream::base::find(mQueueInfo, unboxed_queue);
@@ -3951,6 +3990,10 @@ class VkDecoderGlobalState::Impl {
 
                     if (queueInfo->pendingOps == nullptr) {
                         // Not a shared queue
+                        continue;
+                    }
+
+                    if (!seenDispatchQueues.insert(queueInfo->dispatchQueue).second) {
                         continue;
                     }
 
@@ -3978,7 +4021,7 @@ class VkDecoderGlobalState::Impl {
                         if (pendingSubmitCall->mSubmitInfo2s.size()) {
                             // Deferred vkQueueSubmit2 call
                             res = deviceDispatch->vkQueueSubmit2(
-                                unboxed_queue, pendingSubmitCall->mSubmitInfo2s.size(),
+                                queueInfo->dispatchQueue, pendingSubmitCall->mSubmitInfo2s.size(),
                                 pendingSubmitCall->mSubmitInfo2s.data(), pendingSubmitCall->mFence);
 
                             if (res == VK_SUCCESS) {
@@ -3998,7 +4041,7 @@ class VkDecoderGlobalState::Impl {
                         } else {
                             // Deferred vkQueueSubmit call
                             res = deviceDispatch->vkQueueSubmit(
-                                unboxed_queue, pendingSubmitCall->mSubmitInfos.size(),
+                                queueInfo->dispatchQueue, pendingSubmitCall->mSubmitInfos.size(),
                                 pendingSubmitCall->mSubmitInfos.data(), pendingSubmitCall->mFence);
 
                             if (res == VK_SUCCESS) {
@@ -6627,57 +6670,81 @@ class VkDecoderGlobalState::Impl {
                                                  uint32_t waitSemaphoreCount,
                                                  const VkSemaphore* pWaitSemaphores, VkImage image,
                                                  int* pNativeFenceFd) {
-        auto queue = unbox_VkQueue(boxed_queue);
+        auto trackingQueue = underlying_VkQueue(boxed_queue);
         auto vk = dispatch_VkQueue(boxed_queue);
+        uint32_t queueFamilyIndex = 0;
+        VkQueue dispatchQueue = VK_NULL_HANDLE;
+        std::mutex* queueMutex = nullptr;
+        AndroidNativeBufferInfo* anbInfo = nullptr;
 
-        std::lock_guard<std::mutex> lock(mMutex);
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
 
-        auto* queueInfo = gfxstream::base::find(mQueueInfo, queue);
-        if (!queueInfo) return VK_ERROR_INITIALIZATION_FAILED;
+            auto* queueInfo = gfxstream::base::find(mQueueInfo, trackingQueue);
+            if (!queueInfo) return VK_ERROR_INITIALIZATION_FAILED;
+            queueFamilyIndex = queueInfo->queueFamilyIndex;
+            dispatchQueue = queueInfo->dispatchQueue;
+            queueMutex = queueInfo->queueMutex.get();
 
-        if (mRenderDocWithMultipleVkInstances) {
-            auto* deviceInfo = gfxstream::base::find(mDeviceInfo, queueInfo->device);
-            if (!deviceInfo) return VK_ERROR_INITIALIZATION_FAILED;
+            if (mRenderDocWithMultipleVkInstances) {
+                auto* deviceInfo = gfxstream::base::find(mDeviceInfo, queueInfo->device);
+                if (!deviceInfo) return VK_ERROR_INITIALIZATION_FAILED;
 
-            auto* phyDeviceInfo = gfxstream::base::find(mPhysdevInfo, deviceInfo->physicalDevice);
-            if (!phyDeviceInfo) return VK_ERROR_INITIALIZATION_FAILED;
-            mRenderDocWithMultipleVkInstances->onFrameDelimiter(phyDeviceInfo->instance);
-        }
+                auto* phyDeviceInfo = gfxstream::base::find(mPhysdevInfo, deviceInfo->physicalDevice);
+                if (!phyDeviceInfo) return VK_ERROR_INITIALIZATION_FAILED;
+                mRenderDocWithMultipleVkInstances->onFrameDelimiter(phyDeviceInfo->instance);
+            }
 
-        auto* imageInfo = gfxstream::base::find(mImageInfo, image);
-        if (!imageInfo) return VK_ERROR_INITIALIZATION_FAILED;
+            auto* imageInfo = gfxstream::base::find(mImageInfo, image);
+            if (!imageInfo) return VK_ERROR_INITIALIZATION_FAILED;
 
-        auto* anbInfo = imageInfo->anbInfo.get();
-        if (anbInfo->isUsingNativeImage()) {
-            // vkQueueSignalReleaseImageANDROID() is only called by the Android framework's
-            // implementation of vkQueuePresentKHR(). The guest application is responsible for
-            // transitioning the image layout of the image passed to vkQueuePresentKHR() to
-            // VK_IMAGE_LAYOUT_PRESENT_SRC_KHR before the call. If the host is using native
-            // Vulkan images where `image` is backed with the same memory as its ColorBuffer,
-            // then we need to update the tracked layout for that ColorBuffer.
-            m_vkEmulation->setColorBufferCurrentLayout(anbInfo->getColorBufferHandle(),
-                                        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-        }
+            anbInfo = imageInfo->anbInfo.get();
+            if (anbInfo->isUsingNativeImage()) {
+                // vkQueueSignalReleaseImageANDROID() is only called by the Android framework's
+                // implementation of vkQueuePresentKHR(). The guest application is responsible for
+                // transitioning the image layout of the image passed to vkQueuePresentKHR() to
+                // VK_IMAGE_LAYOUT_PRESENT_SRC_KHR before the call. If the host is using native
+                // Vulkan images where `image` is backed with the same memory as its ColorBuffer,
+                // then we need to update the tracked layout for that ColorBuffer.
+                m_vkEmulation->setColorBufferCurrentLayout(anbInfo->getColorBufferHandle(),
+                                                           VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+            }
 
-        if (snapshotsEnabled()) {
-            for (uint32_t j = 0; j < waitSemaphoreCount; j++) {
-                auto unboxed_semaphore = pWaitSemaphores[j];
-                auto semaphoreInfoIt = mSemaphoreInfo.find(unboxed_semaphore);
-                if (semaphoreInfoIt == mSemaphoreInfo.end()) {
-                    GFXSTREAM_ERROR("Failed to find VkSemaphore:%p", unboxed_semaphore);
-                    return VK_ERROR_VALIDATION_FAILED_EXT;
+            if (snapshotsEnabled()) {
+                for (uint32_t j = 0; j < waitSemaphoreCount; j++) {
+                    auto unboxed_semaphore = pWaitSemaphores[j];
+                    auto semaphoreInfoIt = mSemaphoreInfo.find(unboxed_semaphore);
+                    if (semaphoreInfoIt == mSemaphoreInfo.end()) {
+                        GFXSTREAM_ERROR("Failed to find VkSemaphore:%p", unboxed_semaphore);
+                        return VK_ERROR_VALIDATION_FAILED_EXT;
+                    }
+                    auto& semaphoreInfo = semaphoreInfoIt->second;
+                    if (semaphoreInfo.isTimelineSemaphore) {
+                        // timeline semaphore is not handled yet
+                        continue;
+                    }
+                    semaphoreInfo.onQueueSubmissionWait();
                 }
-                auto& semaphoreInfo = semaphoreInfoIt->second;
-                if (semaphoreInfo.isTimelineSemaphore) {
-                    // timeline semaphore is not handled yet
-                    continue;
-                }
-                semaphoreInfo.onQueueSubmissionWait();
             }
         }
-        return anbInfo->on_vkQueueSignalReleaseImageANDROID(
-            m_vkEmulation, vk, queueInfo->queueFamilyIndex, queue, queueInfo->queueMutex.get(),
-            waitSemaphoreCount, pWaitSemaphores, pNativeFenceFd);
+
+        std::optional<gfxstream::CancelableFuture> completionWaitable;
+        VkResult result = anbInfo->on_vkQueueSignalReleaseImageANDROID(
+            m_vkEmulation, vk, queueFamilyIndex, dispatchQueue, queueMutex, waitSemaphoreCount,
+            pWaitSemaphores, pNativeFenceFd, &completionWaitable);
+        if (result != VK_SUCCESS) {
+            return result;
+        }
+
+        if (completionWaitable) {
+            std::lock_guard<std::mutex> lock(mMutex);
+            auto* queueInfo = gfxstream::base::find(mQueueInfo, trackingQueue);
+            if (queueInfo) {
+                queueInfo->latestTrackedWork = QueueTrackedWork(*completionWaitable);
+            }
+        }
+
+        return VK_SUCCESS;
     }
 
     void on_vkTraceAsyncGOOGLE(gfxstream::base::BumpPool*, VkSnapshotApiCallHandle, uint64_t id) {
@@ -7038,16 +7105,62 @@ class VkDecoderGlobalState::Impl {
     template <typename VkSubmitInfoType>
     bool safeToSubmit(bool usingSharedPhysicalQueue, uint32_t submitCount,
                       const VkSubmitInfoType* pSubmits) {
-        // TODO(b/379862480): also check if the timelinesemaphore feature is enabled on the device
         if (!usingSharedPhysicalQueue) {
             // When the physical queue is not shared, it's app's responsibility to ensure
             // correct signaling of the semaphores.
             return true;
         }
 
-        // Check any of the waits are depending on signal_after_wait behavior and should be
-        // deferred to avoid hangs when virtual queue is enabled with physical queue sharing.
-        // TODO(b/379862480): optimize binary semaphore handling, remove `inSubmissionSignalValues`
+        struct TimelineSemaphoreSnapshot {
+            bool isTimelineSemaphore = false;
+            uint64_t lastSignalValue = 0;
+        };
+
+        std::unordered_map<VkSemaphore, TimelineSemaphoreSnapshot> semaphoreSnapshots;
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            for (uint32_t submitIndex = 0; submitIndex < submitCount; submitIndex++) {
+                const VkSubmitInfoType& submit = pSubmits[submitIndex];
+                const uint32_t waitSemaphoreCount = getWaitSemaphoreCount(submit);
+                for (uint32_t i = 0; i < waitSemaphoreCount; i++) {
+                    VkSemaphore waitSemaphore = getWaitSemaphore(submit, i);
+                    if (semaphoreSnapshots.find(waitSemaphore) != semaphoreSnapshots.end()) {
+                        continue;
+                    }
+                    auto semaphoreInfo = gfxstream::base::find(mSemaphoreInfo, waitSemaphore);
+                    if (!semaphoreInfo) {
+                        continue;
+                    }
+                    semaphoreSnapshots.emplace(
+                        waitSemaphore,
+                        TimelineSemaphoreSnapshot{
+                            .isTimelineSemaphore = semaphoreInfo->isTimelineSemaphore,
+                            .lastSignalValue = semaphoreInfo->lastSignalValue,
+                        });
+                }
+
+                const uint32_t signalSemaphoreCount = getSignalSemaphoreCount(submit);
+                for (uint32_t i = 0; i < signalSemaphoreCount; i++) {
+                    VkSemaphore signalSemaphore = getSignalSemaphore(submit, i);
+                    if (semaphoreSnapshots.find(signalSemaphore) != semaphoreSnapshots.end()) {
+                        continue;
+                    }
+                    auto semaphoreInfo = gfxstream::base::find(mSemaphoreInfo, signalSemaphore);
+                    if (!semaphoreInfo) {
+                        continue;
+                    }
+                    semaphoreSnapshots.emplace(
+                        signalSemaphore,
+                        TimelineSemaphoreSnapshot{
+                            .isTimelineSemaphore = semaphoreInfo->isTimelineSemaphore,
+                            .lastSignalValue = semaphoreInfo->lastSignalValue,
+                        });
+                }
+            }
+        }
+
+        // Check waits that depend on signal_after_wait behavior and should be deferred to avoid
+        // hangs when virtual queue is enabled with physical queue sharing.
         std::unordered_map<VkSemaphore, uint64_t> inSubmissionSignalValues;
         for (uint32_t submitIndex = 0; submitIndex < submitCount; submitIndex++) {
             const VkSubmitInfoType& submit = pSubmits[submitIndex];
@@ -7070,12 +7183,13 @@ class VkDecoderGlobalState::Impl {
                 VkSemaphore waitSemaphore = getWaitSemaphore(submit, i);
                 const uint64_t waitSemaphoreValue = getWaitSemaphoreValue(submit, i);
 
-                // TODO(b/379862480): inefficient mutex lock
-                std::lock_guard<std::mutex> lock(mMutex);
-                auto semaphoreInfo = gfxstream::base::find(mSemaphoreInfo, waitSemaphore);
-                if (semaphoreInfo == nullptr) continue;
+                auto iterSnapshot = semaphoreSnapshots.find(waitSemaphore);
+                if (iterSnapshot == semaphoreSnapshots.end() ||
+                    !iterSnapshot->second.isTimelineSemaphore) {
+                    continue;
+                }
 
-                if (semaphoreInfo->lastSignalValue < waitSemaphoreValue) {
+                if (iterSnapshot->second.lastSignalValue < waitSemaphoreValue) {
                     auto iter = inSubmissionSignalValues.find(waitSemaphore);
                     if (iter == inSubmissionSignalValues.end() ||
                         iter->second < waitSemaphoreValue) {
@@ -7091,7 +7205,17 @@ class VkDecoderGlobalState::Impl {
                 VkSemaphore signalSemaphore = getSignalSemaphore(submit, i);
                 const uint64_t signalSemaphoreValue = getSignalSemaphoreValue(submit, i);
 
-                inSubmissionSignalValues[signalSemaphore] = signalSemaphoreValue;
+                auto iterSnapshot = semaphoreSnapshots.find(signalSemaphore);
+                if (iterSnapshot == semaphoreSnapshots.end() ||
+                    !iterSnapshot->second.isTimelineSemaphore) {
+                    continue;
+                }
+
+                auto [iter, inserted] =
+                    inSubmissionSignalValues.emplace(signalSemaphore, signalSemaphoreValue);
+                if (!inserted && iter->second < signalSemaphoreValue) {
+                    iter->second = signalSemaphoreValue;
+                }
             }
         }
 
@@ -7107,6 +7231,9 @@ class VkDecoderGlobalState::Impl {
             SemaphoreInfo* semInfo = gfxstream::base::find(mSemaphoreInfo, sem);
             if (!semInfo) {
                 GFXSTREAM_ERROR("%s:%d - semaphore %p not found!", __func__, __LINE__, sem);
+                continue;
+            }
+            if (!semInfo->isTimelineSemaphore) {
                 continue;
             }
             if (semInfo->lastSignalValue < waitValue) {
@@ -7246,6 +7373,7 @@ class VkDecoderGlobalState::Impl {
     VkResult on_vkQueueSubmit(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
                               VkQueue boxed_queue, uint32_t submitCount,
                               const VkSubmitInfoType* pSubmits, VkFence fence) {
+        auto trackingQueue = underlying_VkQueue(boxed_queue);
         auto queue = unbox_VkQueue(boxed_queue);
         auto vk = dispatch_VkQueue(boxed_queue);
 
@@ -7297,12 +7425,13 @@ class VkDecoderGlobalState::Impl {
                 }
             }
 
-            auto* queueInfo = gfxstream::base::find(mQueueInfo, queue);
+            auto* queueInfo = gfxstream::base::find(mQueueInfo, trackingQueue);
             if (!queueInfo) {
-                GFXSTREAM_ERROR("vkQueueSubmit cannot find queue info for %p", queue);
+                GFXSTREAM_ERROR("vkQueueSubmit cannot find queue info for %p", trackingQueue);
                 return VK_ERROR_INITIALIZATION_FAILED;
             }
             device = queueInfo->device;
+            queue = queueInfo->dispatchQueue;
             queueMutex = queueInfo->queueMutex.get();
             pendingOps = queueInfo->pendingOps.get();
             sharedQueue = queueInfo->usingSharedPhysicalQueue;
@@ -7483,6 +7612,10 @@ class VkDecoderGlobalState::Impl {
 
         {
             std::lock_guard<std::mutex> lock(mMutex);
+            auto* queueInfo = gfxstream::base::find(mQueueInfo, trackingQueue);
+            if (queueInfo) {
+                queueInfo->latestTrackedWork = QueueTrackedWork(queueCompletedWaitable);
+            }
             // Update image layouts
             for (uint32_t i = 0; i < submitCount; i++) {
                 for (int j = 0; j < getCommandBufferCount(pSubmits[i]); j++) {
@@ -7591,26 +7724,40 @@ class VkDecoderGlobalState::Impl {
 
     VkResult on_vkQueueWaitIdle(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
                                 VkQueue boxed_queue) {
-        auto queue = unbox_VkQueue(boxed_queue);
+        auto trackingQueue = underlying_VkQueue(boxed_queue);
         auto vk = dispatch_VkQueue(boxed_queue);
 
-        if (!queue) return VK_SUCCESS;
+        if (!trackingQueue) return VK_SUCCESS;
 
-        std::mutex* queueMutex;
+        std::mutex* queueMutex = nullptr;
+        VkQueue dispatchQueue = VK_NULL_HANDLE;
+        std::optional<QueueTrackedWork> trackedWork;
+        DeviceOpTrackerPtr deviceOpTracker;
+        bool usingSharedPhysicalQueue = false;
         {
             std::lock_guard<std::mutex> lock(mMutex);
-            auto* queueInfo = gfxstream::base::find(mQueueInfo, queue);
+            auto* queueInfo = gfxstream::base::find(mQueueInfo, trackingQueue);
             if (!queueInfo) return VK_SUCCESS;
+            dispatchQueue = queueInfo->dispatchQueue;
             queueMutex = queueInfo->queueMutex.get();
+            usingSharedPhysicalQueue = queueInfo->usingSharedPhysicalQueue;
+            trackedWork = queueInfo->latestTrackedWork;
+
+            auto* deviceInfo = gfxstream::base::find(mDeviceInfo, queueInfo->device);
+            if (deviceInfo) {
+                deviceOpTracker = deviceInfo->deviceOpTracker;
+            }
         }
 
-        // TODO(b/379862480): register and track gpu workload to wait only for the
-        // necessary work when the virtual graphics queue is enabled, ie. not any
-        // other fences/work. It should not hold the queue lock/ql while waiting to allow
-        // submissions and other operations on the virtualized queue
+        if (usingSharedPhysicalQueue) {
+            if (!hasTrackedQueueWork(trackedWork)) {
+                return VK_SUCCESS;
+            }
+            return waitForTrackedQueueWork(*trackedWork, deviceOpTracker);
+        }
 
         std::lock_guard<std::mutex> queueLock(*queueMutex);
-        return vk->vkQueueWaitIdle(queue);
+        return vk->vkQueueWaitIdle(dispatchQueue);
     }
 
     VkResult on_vkResetCommandBuffer(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
@@ -8479,88 +8626,156 @@ class VkDecoderGlobalState::Impl {
             }
         }
 
+        auto trackingQueue = underlying_VkQueue(boxed_queue);
         auto queue = unbox_VkQueue(boxed_queue);
         auto vk = dispatch_VkQueue(boxed_queue);
-        if (!hasTimelineSemaphoreSubmitInfo) {
-            (void)pool;
-            return vk->vkQueueBindSparse(queue, bindInfoCount, pBindInfo, fence);
-        } else {
-            std::vector<VkPipelineStageFlags> waitDstStageMasks;
-            VkTimelineSemaphoreSubmitInfoKHR currTsSi = {
-                VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, 0, 0, nullptr, 0, nullptr,
-            };
+        VkDevice device = VK_NULL_HANDLE;
+        std::mutex* queueMutex = nullptr;
+        DeviceOpTrackerPtr deviceOpTracker;
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            auto* queueInfo = gfxstream::base::find(mQueueInfo, trackingQueue);
+            if (!queueInfo) {
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+            queue = queueInfo->dispatchQueue;
+            queueMutex = queueInfo->queueMutex.get();
+            device = queueInfo->device;
 
-            VkSubmitInfo currSi = {
-                VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                &currTsSi,
-                0,
-                nullptr,
-                nullptr,
-                0,
-                nullptr,  // No commands
-                0,
-                nullptr,
-            };
+            auto* deviceInfo = gfxstream::base::find(mDeviceInfo, device);
+            if (!deviceInfo) {
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+            deviceOpTracker = deviceInfo->deviceOpTracker;
+        }
 
-            VkBindSparseInfo currBi;
+        DeviceOpBuilder builder(*deviceOpTracker);
+        VkFence usedFence = fence;
+        if (usedFence == VK_NULL_HANDLE) {
+            usedFence = builder.CreateFenceForOp();
+            if (usedFence == VK_NULL_HANDLE) {
+                builder.MarkSubmissionFailed();
+                return VK_ERROR_OUT_OF_HOST_MEMORY;
+            }
+        }
 
-            VkResult res;
+        VkResult res = VK_SUCCESS;
+        {
+            std::lock_guard<std::mutex> queueLock(*queueMutex);
+            if (!hasTimelineSemaphoreSubmitInfo) {
+                (void)pool;
+                res = vk->vkQueueBindSparse(queue, bindInfoCount, pBindInfo, usedFence);
+            } else {
+                std::vector<VkPipelineStageFlags> waitDstStageMasks;
+                VkTimelineSemaphoreSubmitInfoKHR currTsSi = {
+                    VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, 0, 0, nullptr, 0, nullptr,
+                };
 
-            for (uint32_t i = 0; i < bindInfoCount; ++i) {
-                const VkTimelineSemaphoreSubmitInfoKHR* tsSi =
-                    vk_find_struct<VkTimelineSemaphoreSubmitInfoKHR>(pBindInfo + i);
-                if (!tsSi) {
-                    res = vk->vkQueueBindSparse(queue, 1, pBindInfo + i, fence);
-                    if (VK_SUCCESS != res) return res;
-                    continue;
+                VkSubmitInfo currSi = {
+                    VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                    &currTsSi,
+                    0,
+                    nullptr,
+                    nullptr,
+                    0,
+                    nullptr,  // No commands
+                    0,
+                    nullptr,
+                };
+
+                VkBindSparseInfo currBi;
+
+                for (uint32_t i = 0; i < bindInfoCount; ++i) {
+                    const VkTimelineSemaphoreSubmitInfoKHR* tsSi =
+                        vk_find_struct<VkTimelineSemaphoreSubmitInfoKHR>(pBindInfo + i);
+                    if (!tsSi) {
+                        res = vk->vkQueueBindSparse(queue, 1, pBindInfo + i,
+                                                    i == bindInfoCount - 1 ? usedFence
+                                                                           : VK_NULL_HANDLE);
+                        if (res != VK_SUCCESS) {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    currTsSi.waitSemaphoreValueCount = tsSi->waitSemaphoreValueCount;
+                    currTsSi.pWaitSemaphoreValues = tsSi->pWaitSemaphoreValues;
+                    currTsSi.signalSemaphoreValueCount = 0;
+                    currTsSi.pSignalSemaphoreValues = nullptr;
+
+                    currSi.waitSemaphoreCount = pBindInfo[i].waitSemaphoreCount;
+                    currSi.pWaitSemaphores = pBindInfo[i].pWaitSemaphores;
+                    waitDstStageMasks.resize(pBindInfo[i].waitSemaphoreCount,
+                                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+                    currSi.pWaitDstStageMask = waitDstStageMasks.data();
+
+                    currSi.signalSemaphoreCount = 0;
+                    currSi.pSignalSemaphores = nullptr;
+
+                    res = vk->vkQueueSubmit(queue, 1, &currSi, VK_NULL_HANDLE);
+                    if (res != VK_SUCCESS) {
+                        break;
+                    }
+
+                    currBi = pBindInfo[i];
+                    vk_struct_chain_remove(tsSi, &currBi);
+
+                    currBi.waitSemaphoreCount = 0;
+                    currBi.pWaitSemaphores = nullptr;
+                    currBi.signalSemaphoreCount = 0;
+                    currBi.pSignalSemaphores = nullptr;
+
+                    res = vk->vkQueueBindSparse(queue, 1, &currBi, VK_NULL_HANDLE);
+                    if (res != VK_SUCCESS) {
+                        break;
+                    }
+
+                    currTsSi.waitSemaphoreValueCount = 0;
+                    currTsSi.pWaitSemaphoreValues = nullptr;
+                    currTsSi.signalSemaphoreValueCount = tsSi->signalSemaphoreValueCount;
+                    currTsSi.pSignalSemaphoreValues = tsSi->pSignalSemaphoreValues;
+
+                    currSi.waitSemaphoreCount = 0;
+                    currSi.pWaitSemaphores = nullptr;
+                    currSi.signalSemaphoreCount = pBindInfo[i].signalSemaphoreCount;
+                    currSi.pSignalSemaphores = pBindInfo[i].pSignalSemaphores;
+
+                    res = vk->vkQueueSubmit(queue, 1, &currSi,
+                                            i == bindInfoCount - 1 ? usedFence
+                                                                   : VK_NULL_HANDLE);
+                    if (res != VK_SUCCESS) {
+                        break;
+                    }
                 }
+            }
+        }
 
-                currTsSi.waitSemaphoreValueCount = tsSi->waitSemaphoreValueCount;
-                currTsSi.pWaitSemaphoreValues = tsSi->pWaitSemaphoreValues;
-                currTsSi.signalSemaphoreValueCount = 0;
-                currTsSi.pSignalSemaphoreValues = nullptr;
+        if (res != VK_SUCCESS) {
+            builder.MarkSubmissionFailed();
+            return res;
+        }
 
-                currSi.waitSemaphoreCount = pBindInfo[i].waitSemaphoreCount;
-                currSi.pWaitSemaphores = pBindInfo[i].pWaitSemaphores;
-                waitDstStageMasks.resize(pBindInfo[i].waitSemaphoreCount,
-                                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
-                currSi.pWaitDstStageMask = waitDstStageMasks.data();
-
-                currSi.signalSemaphoreCount = 0;
-                currSi.pSignalSemaphores = nullptr;
-
-                res = vk->vkQueueSubmit(queue, 1, &currSi, nullptr);
-                if (VK_SUCCESS != res) return res;
-
-                currBi = pBindInfo[i];
-
-                vk_struct_chain_remove(tsSi, &currBi);
-
-                currBi.waitSemaphoreCount = 0;
-                currBi.pWaitSemaphores = nullptr;
-                currBi.signalSemaphoreCount = 0;
-                currBi.pSignalSemaphores = nullptr;
-
-                res = vk->vkQueueBindSparse(queue, 1, &currBi, nullptr);
-                if (VK_SUCCESS != res) return res;
-
-                currTsSi.waitSemaphoreValueCount = 0;
-                currTsSi.pWaitSemaphoreValues = nullptr;
-                currTsSi.signalSemaphoreValueCount = tsSi->signalSemaphoreValueCount;
-                currTsSi.pSignalSemaphoreValues = tsSi->pSignalSemaphoreValues;
-
-                currSi.waitSemaphoreCount = 0;
-                currSi.pWaitSemaphores = nullptr;
-                currSi.signalSemaphoreCount = pBindInfo[i].signalSemaphoreCount;
-                currSi.pSignalSemaphores = pBindInfo[i].pSignalSemaphores;
-
-                res =
-                    vk->vkQueueSubmit(queue, 1, &currSi, i == bindInfoCount - 1 ? fence : nullptr);
-                if (VK_SUCCESS != res) return res;
+        DeviceOpWaitable bindSparseWaitable = builder.OnQueueSubmittedWithFence(usedFence);
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            auto* queueInfo = gfxstream::base::find(mQueueInfo, trackingQueue);
+            if (queueInfo) {
+                queueInfo->latestTrackedWork = QueueTrackedWork(bindSparseWaitable);
             }
 
-            return VK_SUCCESS;
+            auto* fenceInfo = gfxstream::base::find(mFenceInfo, fence);
+            if (fenceInfo) {
+                {
+                    std::unique_lock<std::mutex> fenceLock(fenceInfo->mutex);
+                    fenceInfo->state = FenceInfo::State::kWaitable;
+                }
+                fenceInfo->cv.notify_all();
+                fenceInfo->latestUse = bindSparseWaitable;
+            }
         }
+
+        deviceOpTracker->PollAndProcessGarbage();
+        return VK_SUCCESS;
     }
 
     VkResult on_vkQueuePresentKHR(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,

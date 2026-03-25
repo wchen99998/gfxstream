@@ -144,6 +144,22 @@ TEST_F(VkDecoderGlobalStateExternalFenceDeathTest, undestroyedFences) {
             "fences still not destroyed."));
 }
 
+TEST(VkDecoderGlobalStateQueueHandleTest, UnderlyingQueuePreservesVirtualQueueIdentity) {
+    constexpr uint64_t kPhysicalQueueValue = 0x2222'0000;
+    const auto physicalQueue = reinterpret_cast<VkQueue>(kPhysicalQueueValue);
+    const auto virtualQueue =
+        reinterpret_cast<VkQueue>(kPhysicalQueueValue | QueueInfo::kVirtualQueueBit);
+
+    const auto boxedPhysicalQueue = new_boxed_VkQueue(physicalQueue, nullptr);
+    const auto boxedVirtualQueue = new_boxed_VkQueue(virtualQueue, nullptr);
+
+    EXPECT_EQ(underlying_VkQueue(boxedPhysicalQueue), physicalQueue);
+    EXPECT_EQ(underlying_VkQueue(boxedVirtualQueue), virtualQueue);
+
+    delete_VkQueue(boxedVirtualQueue);
+    delete_VkQueue(boxedPhysicalQueue);
+}
+
 }  // namespace
 }  // namespace vk
 }  // namespace host

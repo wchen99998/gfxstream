@@ -688,7 +688,7 @@ static constexpr uint64_t kTimeoutNs = 3ULL * 1000000000ULL;
 VkResult AndroidNativeBufferInfo::on_vkQueueSignalReleaseImageANDROID(
     VkEmulation* emu, VulkanDispatch* vk, uint32_t queueFamilyIndex, VkQueue queue,
     std::mutex* queueMutex, uint32_t waitSemaphoreCount, const VkSemaphore* pWaitSemaphores,
-    int* pNativeFenceFd) {
+    int* pNativeFenceFd, std::optional<gfxstream::CancelableFuture>* pCompletionWaitable) {
     const uint64_t traceId = gfxstream::host::GetUniqueTracingId();
     GFXSTREAM_TRACE_EVENT(GFXSTREAM_TRACE_DEFAULT_CATEGORY, "vkQSRI syncImageToColorBuffer()",
                           GFXSTREAM_TRACE_FLOW(traceId));
@@ -882,6 +882,9 @@ VkResult AndroidNativeBufferInfo::on_vkQueueSignalReleaseImageANDROID(
             "wait for the guest Qsri VkFence signaled");
 
         queueState.latestUse = std::move(waitable);
+        if (pCompletionWaitable) {
+            *pCompletionWaitable = queueState.latestUse;
+        }
     } else {
         VK_ANB_DEBUG_OBJ(this, "not using native image, so wait right away");
         waitForQsriFenceTask();
