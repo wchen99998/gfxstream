@@ -103,6 +103,7 @@ class ColorBuffer : public LazySnapshotObj<ColorBuffer> {
     bool invalidateForGl();
     bool invalidateForVk();
     bool waitForPendingVulkanCompletion();
+    bool resolveCompletedPendingVulkanCompletions();
     bool hasPendingVulkanCompletion();
     void setPendingVulkanCompletion(CancelableFuture completionFuture,
                                     std::shared_ptr<std::atomic<bool>> completionSucceeded);

@@ -7573,7 +7573,8 @@ class VkDecoderGlobalState::Impl {
         if (!releasedColorBuffers.empty()) {
             const auto backendCallbacks = m_vkEmulation->getCallbacks();
             if (!backendCallbacks.scheduleAsyncWork ||
-                !backendCallbacks.setColorBufferPendingVulkanCompletion) {
+                !backendCallbacks.setColorBufferPendingVulkanCompletion ||
+                !backendCallbacks.resolveCompletedColorBufferVulkanCompletions) {
                 GFXSTREAM_FATAL("Missing backend callbacks for released color buffer sync.");
             }
 
@@ -7608,6 +7609,20 @@ class VkDecoderGlobalState::Impl {
                 backendCallbacks.setColorBufferPendingVulkanCompletion(
                     cb, completionFuture, completionSucceeded);
             }
+
+            auto releaseColorBufferCleanupFuture = backendCallbacks.scheduleAsyncWork(
+                [completionFuture,
+                 releasedColorBuffers = std::vector<HandleType>(releasedColorBuffers.begin(),
+                                                                releasedColorBuffers.end()),
+                 resolveCompletedColorBufferVulkanCompletions =
+                     backendCallbacks.resolveCompletedColorBufferVulkanCompletions]() mutable {
+                    completionFuture.wait();
+                    for (HandleType cb : releasedColorBuffers) {
+                        resolveCompletedColorBufferVulkanCompletions(cb);
+                    }
+                },
+                "resolve completed released color buffer sync");
+            (void)releaseColorBufferCleanupFuture;
         }
 
         {

@@ -14,6 +14,7 @@
 
 #include "color_buffer.h"
 
+#include <chrono>
 #include <deque>
 
 #if GFXSTREAM_ENABLE_HOST_GLES
@@ -93,6 +94,7 @@ class ColorBuffer::Impl : public LazySnapshotObj<ColorBuffer::Impl> {
     bool invalidateForGl();
     bool invalidateForVk();
     bool waitForPendingVulkanCompletion();
+    bool resolveCompletedPendingVulkanCompletions();
     bool hasPendingVulkanCompletion();
     void setPendingVulkanCompletion(CancelableFuture completionFuture,
                                     std::shared_ptr<std::atomic<bool>> completionSucceeded);
@@ -701,6 +703,81 @@ bool ColorBuffer::Impl::waitForPendingVulkanCompletion() {
     return resolvePendingVulkanCompletion();
 }
 
+bool ColorBuffer::Impl::resolveCompletedPendingVulkanCompletions() {
+#if GFXSTREAM_ENABLE_HOST_GLES
+    if (!(mColorBufferGl && mColorBufferVk)) {
+        return true;
+    }
+#else
+    if (!mColorBufferVk) {
+        return true;
+    }
+#endif
+
+    if (mGlAndVkAreSharingExternalMemory) {
+        return true;
+    }
+
+    while (true) {
+        PendingVulkanCompletion pending;
+        uint64_t generation = 0;
+        {
+            gfxstream::base::AutoLock lock(mPendingVulkanCompletionLock);
+            if (mPendingVulkanCompletionInProgress) {
+                return true;
+            }
+            if (mPendingVulkanCompletions.empty()) {
+                return true;
+            }
+
+            const auto& front = mPendingVulkanCompletions.front();
+            if (!front.future.valid() ||
+                front.future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+                return true;
+            }
+
+            pending = front;
+            generation = mPendingVulkanCompletionGeneration;
+            mPendingVulkanCompletionInProgress = true;
+        }
+
+        const CancelableFutureStatus futureStatus = pending.future.get();
+        const bool completionSucceeded =
+            futureStatus == CancelableFutureStatus::kSuccess &&
+            pending.completionSucceeded &&
+            pending.completionSucceeded->load(std::memory_order_acquire);
+
+        gfxstream::base::AutoLock lock(mPendingVulkanCompletionLock);
+        if (mPendingVulkanCompletionGeneration != generation || mPendingVulkanCompletions.empty()) {
+            mPendingVulkanCompletionInProgress = false;
+            mPendingVulkanCompletionCondition.broadcast();
+            continue;
+        }
+
+        mPendingVulkanCompletions.pop_front();
+        mPendingVulkanCompletionInProgress = false;
+
+        if (!completionSucceeded) {
+            mPendingVulkanCompletions.clear();
+            ++mPendingVulkanCompletionGeneration;
+            mPendingVulkanCompletionCondition.broadcast();
+            GFXSTREAM_ERROR("Pending Vulkan completion failed for ColorBuffer:%d", mHandle);
+            return false;
+        }
+
+        if (!mPendingVulkanCompletions.empty()) {
+            mPendingVulkanCompletionCondition.broadcast();
+            continue;
+        }
+
+        mGlTexDirty = false;
+        mVkTexDirty = true;
+        ++mPendingVulkanCompletionGeneration;
+        mPendingVulkanCompletionCondition.broadcast();
+        return true;
+    }
+}
+
 bool ColorBuffer::Impl::hasPendingVulkanCompletion() {
 #if GFXSTREAM_ENABLE_HOST_GLES
     if (!(mColorBufferGl && mColorBufferVk)) {
@@ -1041,6 +1118,10 @@ bool ColorBuffer::invalidateForVk() { return mImpl->invalidateForVk(); }
 
 bool ColorBuffer::waitForPendingVulkanCompletion() {
     return mImpl->waitForPendingVulkanCompletion();
+}
+
+bool ColorBuffer::resolveCompletedPendingVulkanCompletions() {
+    return mImpl->resolveCompletedPendingVulkanCompletions();
 }
 
 bool ColorBuffer::hasPendingVulkanCompletion() {
