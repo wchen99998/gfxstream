@@ -43,27 +43,10 @@ cc_library_headers {
         "host/include",
     ],
     header_libs: [
-        "gfxstream_magma_headers",
         "libgfxstream_thirdparty_vulkan_headers",
     ],
     export_header_lib_headers: [
-        "gfxstream_magma_headers",
         "libgfxstream_thirdparty_vulkan_headers",
-    ],
-    apex_available: [
-        "//apex_available:platform",
-        "com.android.virt",
-    ],
-}
-
-cc_library_headers {
-    name: "gfxstream_magma_headers",
-    vendor_available: true,
-    host_supported: true,
-    export_include_dirs: [
-        "third_party/fuchsia/magma/include",
-        // TODO(b/274956288): use consistent header paths
-        "third_party/fuchsia/magma/include/lib",
     ],
     apex_available: [
         "//apex_available:platform",
@@ -155,6 +138,10 @@ cc_defaults {
     vendor: true,
 }
 
+// Note: `host` in the name means the environment where VMM runs.
+// For the Cuttlefish case, this is Linux, which is referred to as `host` in
+// Soong terms. For the Android Virtualization Framework case, this is
+// Android, which is referred to as `android` in Soong terms.
 cc_defaults {
     name: "gfxstream_host_cc_defaults",
     defaults: [
@@ -162,7 +149,6 @@ cc_defaults {
     ],
     cflags: [
         "-DGFXSTREAM_BUILD_WITH_SNAPSHOT_SUPPORT=1",
-        "-DGFXSTREAM_BUILD_WITH_TRACING=1",
     ] + select(soong_config_variable("gfxstream", "mesa3d_platforms"), {
         // Android surfaceless build
         "none": [
@@ -175,12 +161,14 @@ cc_defaults {
         android: {
             cflags: [
                 "-DVK_USE_PLATFORM_ANDROID_KHR",
+                "-DGFXSTREAM_UNSTABLE_VULKAN_BLOB_COLOR_BUFFER",
             ],
             compile_multilib: "64",
         },
         host: {
             cflags: [
                 "-DGFXSTREAM_BUILD_WITH_SNAPSHOT_FRONTEND_SUPPORT=1",
+                "-DGFXSTREAM_BUILD_WITH_TRACING=1",
             ],
         },
     },

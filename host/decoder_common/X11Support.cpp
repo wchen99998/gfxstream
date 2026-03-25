@@ -14,7 +14,8 @@
 
 #include "gfxstream/host/X11Support.h"
 
-#include "gfxstream/SharedLibrary.h"
+#include "gfxstream/shared_library.h"
+#include "gfxstream/common/logging.h"
 
 #define DEFINE_DUMMY_IMPL(rettype, funcname, args) \
     static rettype dummy_##funcname args { \
@@ -24,15 +25,16 @@
 LIST_XLIB_FUNCTYPES(DEFINE_DUMMY_IMPL)
 LIST_GLX_FUNCTYPES(DEFINE_DUMMY_IMPL)
 
+// This combines x11 and x11-xcb libraries
 class X11FunctionGetter {
     public:
         X11FunctionGetter() :
-            mX11Lib(gfxstream::base::SharedLibrary::open("libX11")) {
+            mX11Lib(gfxstream::host::SharedLibrary::open("libX11")) {
             if (!mX11Lib) {
-                fprintf(stderr, "WARNING: could not open libX11.so, try libX11.so.6\n");
-                mX11Lib = (gfxstream::base::SharedLibrary::open("libX11.so.6"));
+                GFXSTREAM_WARNING("Could not open libX11.so, try libX11.so.6");
+                mX11Lib = (gfxstream::host::SharedLibrary::open("libX11.so.6"));
                 if (!mX11Lib) {
-                    fprintf(stderr, "ERROR: could not open libX11.so.6, give up\n");
+                    GFXSTREAM_ERROR("Could not open libX11.so.6, give up");
                     return;
                 }
             }
@@ -41,13 +43,31 @@ class X11FunctionGetter {
 
                 LIST_XLIB_FUNCS(X11_ASSIGN_DUMMY_IMPL)
 
-            if (!mX11Lib) return;
 
-#define X11_GET_FUNC(funcname) \
-            { \
-                auto f = mX11Lib->findSymbol(#funcname); \
-                if (f) mApi.funcname = (funcname##_t)f; \
-            } \
+            mX11XCBLib = gfxstream::host::SharedLibrary::open("libX11-xcb");
+            if (!mX11XCBLib) {
+                GFXSTREAM_WARNING("Could not open libX11-xcb.so, try libX11-xcb.so.1");
+                mX11XCBLib = (gfxstream::host::SharedLibrary::open("libX11-xcb.so.1"));
+                if (!mX11XCBLib) {
+                    GFXSTREAM_ERROR("Could not open libX11-xcb.so.1, give up");
+                    // Do not return, only disable usage of XCB instead
+                }
+            }
+
+    #define X11_GET_FUNC(funcname)                                                               \
+        {                                                                                        \
+            auto f = mX11Lib->findSymbol(#funcname);                                             \
+            if (f) {                                                                             \
+                mApi.funcname = (funcname##_t)f;                                                 \
+            } else {                                                                             \
+                auto fxcb = mX11XCBLib->findSymbol(#funcname);                                   \
+                if (fxcb) {                                                                      \
+                    mApi.funcname = (funcname##_t)fxcb;                                          \
+                } else {                                                                         \
+                    GFXSTREAM_WARNING("Could not find function symbol '%s'  X11", #funcname);    \
+                }                                                                                \
+            }                                                                                    \
+        } \
 
                 LIST_XLIB_FUNCS(X11_GET_FUNC);
 
@@ -55,7 +75,8 @@ class X11FunctionGetter {
 
         X11Api* getApi() { return &mApi; }
     private:
-        gfxstream::base::SharedLibrary* mX11Lib;
+        gfxstream::host::SharedLibrary* mX11Lib;
+        gfxstream::host::SharedLibrary* mX11XCBLib;
 
         X11Api mApi;
 };
@@ -67,18 +88,25 @@ class GlxFunctionGetter {
         // cases, depending on bad ldconfig configurations, link to the wrapper
         // lib that doesn't behave the same.
         GlxFunctionGetter() :
-            mGlxLib(gfxstream::base::SharedLibrary::open("libGL.so.1")) {
+            mGlxLib(gfxstream::host::SharedLibrary::open("libGL.so.1")) {
 
 #define GLX_ASSIGN_DUMMY_IMPL(funcname) mApi.funcname = dummy_##funcname;
 
                 LIST_GLX_FUNCS(GLX_ASSIGN_DUMMY_IMPL)
 
-            if (!mGlxLib) return;
+            if (!mGlxLib) {
+                GFXSTREAM_WARNING("libGL library couild be loaded!");
+                return;
+            }
 
 #define GLX_GET_FUNC(funcname) \
                 { \
-                auto f = mGlxLib->findSymbol(#funcname); \
-                if (f) mApi.funcname = (funcname##_t)f; \
+                auto f = mGlxLib->findSymbol(#funcname);                                             \
+                if (f) {                                                                             \
+                    mApi.funcname = (funcname##_t)f;                                                 \
+                } else {                                                                             \
+                    GFXSTREAM_WARNING("Could not find function symbol '%s' in libGL", #funcname);    \
+                }                                                                                    \
                 } \
 
                 LIST_GLX_FUNCS(GLX_GET_FUNC);
@@ -88,7 +116,7 @@ class GlxFunctionGetter {
         GlxApi* getApi() { return &mApi; }
 
     private:
-        gfxstream::base::SharedLibrary* mGlxLib;
+        gfxstream::host::SharedLibrary* mGlxLib;
 
         GlxApi mApi;
 };

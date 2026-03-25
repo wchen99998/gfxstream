@@ -16,10 +16,11 @@
 #define VK_TEST_UTILS_H
 
 #include "gfxstream/files/PathUtils.h"
-#include "vulkan/VulkanDispatch.h"
-#include "vulkan/VkUtils.h"
+#include "vulkan/vulkan_dispatch.h"
+#include "vulkan/vk_utils.h"
 
 namespace gfxstream {
+namespace host {
 namespace vk {
 
 struct RenderResourceVkBase
@@ -64,6 +65,7 @@ template <VkImageLayout imageLayout, VkImageUsageFlags imageUsage>
 struct RenderResourceVk : public RenderResourceVkBase {
    public:
     static constexpr VkFormat k_vkFormat = VK_FORMAT_R8G8B8A8_UNORM;
+    static constexpr GfxstreamFormat k_format = GfxstreamFormat::R8G8B8A8_UNORM;
     static constexpr uint32_t k_bpp = 4;
     static constexpr VkImageLayout k_vkImageLayout = imageLayout;
 
@@ -333,6 +335,7 @@ using RenderTextureVk =
     RenderResourceVk<VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_USAGE_SAMPLED_BIT>;
 
 }  // namespace vk
+}  // namespace host
 }  // namespace gfxstream
 
 #endif

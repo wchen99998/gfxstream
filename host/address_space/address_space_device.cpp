@@ -14,13 +14,17 @@
 
 #include "gfxstream/host/address_space_device.h"
 
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
 
 #include "gfxstream/host/address_space_graphics.h"
+#include "gfxstream/host/address_space_host_memory_allocator.h"
 #include "gfxstream/host/address_space_service.h"
+#include "gfxstream/host/address_space_shared_slots_host_memory_allocator.h"
+#include "gfxstream/host/vm_operations.h"
 #include "gfxstream/common/logging.h"
 #include "render-utils/address_space_operations.h"
 
@@ -28,6 +32,21 @@ namespace gfxstream {
 namespace host {
 
 using gfxstream::Stream;
+
+static const address_space_device_control_ops* GetAsgOperationsPtr();
+
+namespace {
+
+bool IsAsgTraceEnabled() {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char* env = std::getenv("QEMU_RUTABAGA_TRACE_ASG");
+        enabled = (env && env[0] && !(env[0] == '0' && env[1] == '\0')) ? 1 : 0;
+    }
+    return enabled;
+}
+
+}  // namespace
 
 class AddressSpaceDeviceState {
   public:
@@ -68,8 +87,34 @@ class AddressSpaceDeviceState {
 
     void createInstance(const struct AddressSpaceCreateInfo& create) {
         std::lock_guard<std::mutex> lock(mContextsMutex);
+        if (IsAsgTraceEnabled()) {
+            GFXSTREAM_INFO(
+                "ASG createInstance handle=%u type=%u phys=0x%llx fromSnapshot=%d",
+                create.handle, create.type,
+                static_cast<unsigned long long>(create.physAddr),
+                create.fromSnapshot ? 1 : 0);
+        }
         auto& contextDesc = mContexts[create.handle];
         contextDesc.device_context = buildAddressSpaceDeviceContext(create);
+    }
+
+    void tellPingInfo(uint32_t handle, uint64_t gpa) {
+        std::lock_guard<std::mutex> lock(mContextsMutex);
+        auto& contextDesc = mContexts[handle];
+
+        contextDesc.pingInfo = reinterpret_cast<AddressSpaceDevicePingInfo*>(
+            get_gfxstream_vm_operations().lookup_user_memory(gpa));
+        contextDesc.pingInfoGpa = gpa;
+
+        if (IsAsgTraceEnabled()) {
+            GFXSTREAM_INFO("ASG tellPingInfo handle=%u gpa=0x%llx hva=%p", handle,
+                           static_cast<unsigned long long>(gpa), contextDesc.pingInfo);
+        }
+
+        if (!contextDesc.pingInfo) {
+            GFXSTREAM_FATAL("Could not resolve ping info GPA 0x%llx for handle %u",
+                            static_cast<unsigned long long>(gpa), handle);
+        }
     }
 
     void ping(uint32_t handle) {
@@ -78,18 +123,32 @@ class AddressSpaceDeviceState {
         AddressSpaceDevicePingInfo* pingInfo = contextDesc.pingInfo;
 
         const uint64_t phys_addr = pingInfo->phys_addr;
+        if (IsAsgTraceEnabled()) {
+            GFXSTREAM_INFO(
+                "ASG ping handle=%u phys=0x%llx size=0x%llx metadata=0x%llx hasContext=%d",
+                handle, static_cast<unsigned long long>(phys_addr),
+                static_cast<unsigned long long>(pingInfo->size),
+                static_cast<unsigned long long>(pingInfo->metadata),
+                contextDesc.device_context ? 1 : 0);
+        }
 
         AddressSpaceDeviceContext *device_context = contextDesc.device_context.get();
         if (device_context) {
             device_context->perform(pingInfo);
         } else {
             // The first ioctl establishes the device type
-            struct AddressSpaceCreateInfo create = {0};
+            struct AddressSpaceCreateInfo create = {};
             create.type = static_cast<uint32_t>(pingInfo->metadata);
             create.physAddr = phys_addr;
 
             contextDesc.device_context = buildAddressSpaceDeviceContext(create);
             pingInfo->metadata = contextDesc.device_context ? 0 : -1;
+            if (IsAsgTraceEnabled()) {
+                GFXSTREAM_INFO(
+                    "ASG ping first-create handle=%u type=%u phys=0x%llx success=%d",
+                    handle, create.type, static_cast<unsigned long long>(create.physAddr),
+                    contextDesc.device_context ? 1 : 0);
+            }
         }
     }
 
@@ -98,17 +157,31 @@ class AddressSpaceDeviceState {
         auto& contextDesc = mContexts[handle];
 
         const uint64_t phys_addr = pingInfo->phys_addr;
+        if (IsAsgTraceEnabled()) {
+            GFXSTREAM_INFO(
+                "ASG pingAtHva handle=%u phys=0x%llx size=0x%llx metadata=0x%llx hva=%p hasContext=%d",
+                handle, static_cast<unsigned long long>(phys_addr),
+                static_cast<unsigned long long>(pingInfo->size),
+                static_cast<unsigned long long>(pingInfo->metadata), pingInfo,
+                contextDesc.device_context ? 1 : 0);
+        }
 
         AddressSpaceDeviceContext *device_context = contextDesc.device_context.get();
         if (device_context) {
             device_context->perform(pingInfo);
         } else {
-            struct AddressSpaceCreateInfo create = {0};
+            struct AddressSpaceCreateInfo create = {};
             create.type = static_cast<uint32_t>(pingInfo->metadata);
             create.physAddr = phys_addr;
 
             contextDesc.device_context = buildAddressSpaceDeviceContext(create);
             pingInfo->metadata = contextDesc.device_context ? 0 : -1;
+            if (IsAsgTraceEnabled()) {
+                GFXSTREAM_INFO(
+                    "ASG pingAtHva first-create handle=%u type=%u phys=0x%llx success=%d",
+                    handle, create.type, static_cast<unsigned long long>(create.physAddr),
+                    contextDesc.device_context ? 1 : 0);
+            }
         }
     }
 
@@ -158,6 +231,7 @@ class AddressSpaceDeviceState {
         }
 
         AddressSpaceGraphicsContext::globalStatePreSave();
+        AddressSpaceSharedSlotsHostMemoryAllocatorContext::globalStateSave(stream);
         AddressSpaceGraphicsContext::globalStateSave(stream);
 
         stream->putBe32(mHandleIndex);
@@ -202,6 +276,11 @@ class AddressSpaceDeviceState {
         // this can be done while an emulator is running
         clear();
 
+        if (!AddressSpaceSharedSlotsHostMemoryAllocatorContext::globalStateLoad(
+                stream, GetAsgOperationsPtr(), gfxstream_address_space_get_hw_funcs())) {
+            return false;
+        }
+
         if (!AddressSpaceGraphicsContext::globalStateLoad(stream, mLoadResources)) {
             return false;
         }
@@ -219,7 +298,7 @@ class AddressSpaceDeviceState {
                 case 0:
                     break;
                 case 1: {
-                    struct AddressSpaceCreateInfo create = {0};
+                    struct AddressSpaceCreateInfo create = {};
                     create.type = static_cast<uint32_t>(stream->getBe32());
                     create.physAddr = pingInfoGpa;
                     create.fromSnapshot = true;
@@ -256,6 +335,7 @@ class AddressSpaceDeviceState {
     void clear() {
         std::lock_guard<std::mutex> lock(mContextsMutex);
         mContexts.clear();
+        AddressSpaceSharedSlotsHostMemoryAllocatorContext::globalStateClear();
 
         std::vector<std::pair<uint64_t, uint64_t>> gpasSizesToErase;
         for (auto& mapping : mMemoryMappings) {
@@ -287,10 +367,25 @@ class AddressSpaceDeviceState {
   private:
     std::unique_ptr<AddressSpaceDeviceContext> buildAddressSpaceDeviceContext(
             const struct AddressSpaceCreateInfo& create) {
+        if (IsAsgTraceEnabled()) {
+            GFXSTREAM_INFO("ASG buildContext type=%u handle=%u phys=0x%llx hw=%p",
+                           create.type, create.handle,
+                           static_cast<unsigned long long>(create.physAddr),
+                           gfxstream_address_space_get_hw_funcs());
+        }
         switch (static_cast<AddressSpaceDeviceType>(create.type)) {
             case AddressSpaceDeviceType::Graphics:
             case AddressSpaceDeviceType::VirtioGpuGraphics:
-                return std::unique_ptr<AddressSpaceDeviceContext>(new AddressSpaceGraphicsContext(create));
+                return std::unique_ptr<AddressSpaceDeviceContext>(
+                    new AddressSpaceGraphicsContext(create));
+            case AddressSpaceDeviceType::HostMemoryAllocator:
+                return std::unique_ptr<AddressSpaceDeviceContext>(
+                    new AddressSpaceHostMemoryAllocatorContext(GetAsgOperationsPtr(),
+                                                               gfxstream_address_space_get_hw_funcs()));
+            case AddressSpaceDeviceType::SharedSlotsHostMemoryAllocator:
+                return std::unique_ptr<AddressSpaceDeviceContext>(
+                    new AddressSpaceSharedSlotsHostMemoryAllocatorContext(
+                        GetAsgOperationsPtr(), gfxstream_address_space_get_hw_funcs()));
             default:
                 GFXSTREAM_FATAL("Unhandled address space context type: %d", create.type);
                 return nullptr;
@@ -299,6 +394,12 @@ class AddressSpaceDeviceState {
 
     bool addMemoryMappingLocked(uint64_t gpa, void *ptr, uint64_t size) {
         if (mMemoryMappings.insert({gpa, {ptr, size}}).second) {
+            if (IsAsgTraceEnabled()) {
+                GFXSTREAM_INFO("ASG addMemoryMapping gpa=0x%llx ptr=%p size=0x%llx",
+                               static_cast<unsigned long long>(gpa), ptr,
+                               static_cast<unsigned long long>(size));
+            }
+            get_gfxstream_vm_operations().map_user_memory(gpa, ptr, size);
             return true;
         } else {
             GFXSTREAM_ERROR("Failed: hva %p -> gpa [0x%llx 0x%llx]",
@@ -309,6 +410,12 @@ class AddressSpaceDeviceState {
 
     bool removeMemoryMappingLocked(uint64_t gpa, uint64_t size) {
         if (mMemoryMappings.erase(gpa) > 0) {
+            if (IsAsgTraceEnabled()) {
+                GFXSTREAM_INFO("ASG removeMemoryMapping gpa=0x%llx size=0x%llx",
+                               static_cast<unsigned long long>(gpa),
+                               static_cast<unsigned long long>(size));
+            }
+            get_gfxstream_vm_operations().unmap_user_memory(gpa, size);
             return true;
         } else {
             GFXSTREAM_FATAL("Failed: gpa [0x%llx 0x%llx]",
@@ -321,18 +428,29 @@ class AddressSpaceDeviceState {
         auto i = mMemoryMappings.lower_bound(gpa); // i->first >= gpa (or i==end)
         if ((i != mMemoryMappings.end()) && (i->first == gpa)) {
             return i->second.first;  // gpa is exactly the beginning of the range
-        } else if (i == mMemoryMappings.begin()) {
-            return nullptr;  // can't '--i', see below
-        } else {
+        }
+
+        if (i != mMemoryMappings.begin()) {
             --i;
 
             if ((i->first + i->second.second) > gpa) {
                 // move the host ptr by +(gpa-base)
+                if (IsAsgTraceEnabled()) {
+                    GFXSTREAM_INFO(
+                        "ASG getHostPtr local-hit gpa=0x%llx base=0x%llx size=0x%llx",
+                        static_cast<unsigned long long>(gpa),
+                        static_cast<unsigned long long>(i->first),
+                        static_cast<unsigned long long>(i->second.second));
+                }
                 return static_cast<char *>(i->second.first) + (gpa - i->first);
-            } else {
-                return nullptr;  // the range does not cover gpa
             }
         }
+
+        if (IsAsgTraceEnabled()) {
+            GFXSTREAM_INFO("ASG getHostPtr vm-lookup gpa=0x%llx",
+                           static_cast<unsigned long long>(gpa));
+        }
+        return get_gfxstream_vm_operations().lookup_user_memory(gpa);
     }
 
 
@@ -359,6 +477,8 @@ static AddressSpaceDeviceState* sAddressSpaceDeviceState() {
     return s;
 }
 
+static const AddressSpaceHwFuncs* sAddressSpaceHwFuncs = nullptr;
+
 static uint32_t sAddressSpaceDeviceGenHandle() {
     return sAddressSpaceDeviceState()->genHandle();
 }
@@ -372,7 +492,7 @@ static void sAddressSpaceDeviceCreateInstance(const struct AddressSpaceCreateInf
 }
 
 static void sAddressSpaceDeviceTellPingInfo(uint32_t handle, uint64_t gpa) {
-    GFXSTREAM_FATAL("Unhandled.");
+    sAddressSpaceDeviceState()->tellPingInfo(handle, gpa);
 }
 
 static void sAddressSpaceDevicePing(uint32_t handle) {
@@ -422,11 +542,11 @@ static void sAddressSpaceDeviceRunDeallocationCallbacks(uint64_t gpa) {
 }
 
 static const struct AddressSpaceHwFuncs* sAddressSpaceDeviceControlGetHwFuncs() {
-    return nullptr;
+    return gfxstream_address_space_get_hw_funcs();
 }
 
-address_space_device_control_ops GetAsgOperations() {
-    return address_space_device_control_ops{
+static const address_space_device_control_ops* GetAsgOperationsPtr() {
+    static const address_space_device_control_ops kAsgOperations = {
         &sAddressSpaceDeviceGenHandle,                     // gen_handle
         &sAddressSpaceDeviceDestroyHandle,                 // destroy_handle
         &sAddressSpaceDeviceTellPingInfo,                  // tell_ping_info
@@ -444,6 +564,12 @@ address_space_device_control_ops GetAsgOperations() {
         &sAddressSpaceDeviceControlGetHwFuncs,             // control_get_hw_funcs
         &sAddressSpaceDeviceCreateInstance,                // create_instance
     };
+
+    return &kAsgOperations;
+}
+
+address_space_device_control_ops GetAsgOperations() {
+    return *GetAsgOperationsPtr();
 };
 
 int gfxstream_address_space_set_load_resources(AddressSpaceDeviceLoadResources resources) {
@@ -460,6 +586,18 @@ int gfxstream_address_space_load_memory_state(gfxstream::Stream *stream) {
     return sAddressSpaceDeviceState()->load(stream) ? 0 : 1;
 }
 
+const AddressSpaceHwFuncs* gfxstream_address_space_set_hw_funcs(const AddressSpaceHwFuncs* hwFuncs) {
+    const AddressSpaceHwFuncs* previous = sAddressSpaceHwFuncs;
+    sAddressSpaceHwFuncs = hwFuncs;
+    if (IsAsgTraceEnabled()) {
+        GFXSTREAM_INFO("ASG set_hw_funcs previous=%p new=%p", previous, hwFuncs);
+    }
+    return previous;
+}
+
+const AddressSpaceHwFuncs* gfxstream_address_space_get_hw_funcs() {
+    return sAddressSpaceHwFuncs;
+}
+
 }  // namespace host
 }  // namespace gfxstream
-

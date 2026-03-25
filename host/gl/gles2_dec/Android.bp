@@ -25,7 +25,7 @@ cc_library_static {
     static_libs: [
         "libgfxstream_common_base",
         "libgfxstream_host_decoder_common",
-        "libgfxstream_host_backend",
+        "libgfxstream_host_common",
         "libgfxstream_host_glsnapshot",
         "libgfxstream_host_iostream",
         "libgfxstream_host_library",
@@ -38,7 +38,8 @@ cc_library_static {
     srcs: [
         "gles2_dec.cpp",
         "gles2_server_context.cpp",
-        "GLESv2Decoder.cpp",
+        "gles_v2_decoder.cpp",
     ],
+
     export_include_dirs: ["."],
 }

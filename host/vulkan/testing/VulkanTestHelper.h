@@ -14,17 +14,16 @@
 
 #pragma once
 
-#include "VkDecoderGlobalState.h"
-#include "VulkanDispatch.h"
 #include "gfxstream/BumpPool.h"
-#include "gfxstream/HealthMonitor.h"
-#include "gfxstream/Metrics.h"
 #include "gfxstream/host/GfxApiLogger.h"
-#include "vulkan/VkCommonOperations.h"
-#include "vulkan/VkDecoderContext.h"
+#include "vk_decoder_global_state.h"
+#include "vulkan_dispatch.h"
 #include "vulkan/testing/VkDecoderTestDispatch.h"
+#include "vulkan/vk_common_operations.h"
+#include "vulkan/vk_decoder_context.h"
 
 namespace gfxstream {
+namespace host {
 namespace vk {
 namespace testing {
 
@@ -117,4 +116,5 @@ class VulkanTestHelper {
 
 }  // namespace testing
 }  // namespace vk
+}  // namespace host
 }  // namespace gfxstream

@@ -76,7 +76,7 @@ if host_machine.system() == 'qnx'
 elif host_machine.system() == 'linux'
   thread_dep = dependency('threads')
   gfxstream_host_args += '-DGFXSTREAM_UNSTABLE_VULKAN_EXTERNAL_SYNC=1'
-  gfxstream_host_args += '-DGFXSTREAM_UNSTABLE_VULKAN_DMABUF_WINSYS=1'
+  gfxstream_host_args += '-DGFXSTREAM_UNSTABLE_VULKAN_BLOB_COLOR_BUFFER=1'
   gfxstream_host_args += '-DHAVE_MEMFD_CREATE=1'
 else
   thread_dep = dependency('threads')
@@ -87,6 +87,9 @@ if host_machine.system() == 'darwin'
   cocoa_dep = dependency('appleframeworks', modules: 'Cocoa', required: true)
   corefoundation_dep = dependency('appleframeworks', modules: 'CoreFoundation', required: true)
   iokit_dep = dependency('appleframeworks', modules: 'IOKit', required: true)
+  opengl_dep = dependency('appleframeworks', modules: 'OpenGL', required: true)
+  quartzcore_dep = dependency('appleframeworks', modules: 'QuartzCore', required: true)
+  iosurface_dep = dependency('appleframeworks', modules: 'IOSurface', required: true)
 endif
 
 if log_level == 'error'

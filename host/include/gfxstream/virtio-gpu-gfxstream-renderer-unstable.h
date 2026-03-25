@@ -50,27 +50,21 @@ struct stream_renderer_param_host_visible_memory_mask {
 // Enables the host to control which GPU is used for rendering.
 #define STREAM_RENDERER_PARAM_RENDERING_GPU 9
 
-// External callbacks for tracking metrics.
-// Separating each function to a parameter allows new functions to be added later.
-#define STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT 1024
-typedef void (*stream_renderer_param_metrics_callback_add_instant_event)(int64_t event_code);
-
-#define STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_DESCRIPTOR 1025
-typedef void (*stream_renderer_param_metrics_callback_add_instant_event_with_descriptor)(
-    int64_t event_code, int64_t descriptor);
-
-#define STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_INSTANT_EVENT_WITH_METRIC 1026
-typedef void (*stream_renderer_param_metrics_callback_add_instant_event_with_metric)(
-    int64_t event_code, int64_t metric_value);
-
-#define STREAM_RENDERER_PARAM_METRICS_CALLBACK_ADD_VULKAN_OUT_OF_MEMORY_EVENT 1027
-typedef void (*stream_renderer_param_metrics_callback_add_vulkan_out_of_memory_event)(
-    int64_t result_code, uint32_t op_code, const char* function, uint32_t line,
-    uint64_t allocation_size, bool is_host_side_result, bool is_allocation);
-
 // STREAM_RENDERER_PARAM_RENDERER_FEATURES: stream_renderer_param::value is a pointer to a null
 // terminated string of the form "<feature1 name>:[enabled|disabled],<feature 2 ...>".
 #define STREAM_RENDERER_PARAM_RENDERER_FEATURES 11
+
+// STREAM_RENDERER_PARAM_GFXSTREAM_VM_OPS: stream_renderer_param::value is a pointer to a
+// gfxstream_vm_ops struct.
+#define STREAM_RENDERER_PARAM_GFXSTREAM_VM_OPS 12
+
+// STREAM_RENDERER_PARAM_ADDRESS_SPACE_HW_FUNCS: stream_renderer_param::value is a pointer to an
+// AddressSpaceHwFuncs struct.
+#define STREAM_RENDERER_PARAM_ADDRESS_SPACE_HW_FUNCS 13
+
+// STREAM_RENDERER_PARAM_DISPLAY_WIDTH_MM / _HEIGHT_MM: physical display size in millimeters.
+#define STREAM_RENDERER_PARAM_DISPLAY_WIDTH_MM 14
+#define STREAM_RENDERER_PARAM_DISPLAY_HEIGHT_MM 15
 
 #define STREAM_RENDERER_PARAM_METRICS_CALLBACK_SET_ANNOTATION 1028
 typedef void (*stream_renderer_param_metrics_callback_set_annotation)(const char* key,
@@ -78,11 +72,35 @@ typedef void (*stream_renderer_param_metrics_callback_set_annotation)(const char
 
 #define STREAM_RENDERER_PARAM_METRICS_CALLBACK_ABORT 1029
 typedef void (*stream_renderer_param_metrics_callback_abort)();
-
 VG_EXPORT void gfxstream_backend_setup_window(void* native_window_handle, int32_t window_x,
                                               int32_t window_y, int32_t window_width,
                                               int32_t window_height, int32_t fb_width,
                                               int32_t fb_height);
+
+VG_EXPORT int gfxstream_backend_setup_native_surface(
+    uint32_t display_id, void* native_window_handle,
+    int32_t width_pt, int32_t height_pt,
+    int32_t width_px, int32_t height_px,
+    float dpr);
+
+VG_EXPORT int gfxstream_backend_teardown_native_surface(uint32_t display_id);
+
+VG_EXPORT int gfxstream_backend_resize_native_surface(
+    uint32_t display_id,
+    int32_t width_pt, int32_t height_pt,
+    int32_t width_px, int32_t height_px,
+    float dpr);
+
+VG_EXPORT int gfxstream_backend_set_scanout_resource(
+    uint32_t scanout_id, uint32_t resource_id,
+    uint32_t width, uint32_t height);
+
+/* Returns 1 if presented (native mode), 0 if legacy fallback is needed. */
+VG_EXPORT int gfxstream_backend_present_flushed_resource(
+    uint32_t resource_id, uint32_t x, uint32_t y,
+    uint32_t width, uint32_t height);
+
+VG_EXPORT void gfxstream_backend_set_vsync_hz(int vsync_hz);
 
 VG_EXPORT void stream_renderer_flush(uint32_t res_handle);
 
@@ -111,6 +129,14 @@ VG_EXPORT int stream_renderer_snapshot(const char* dir);
 VG_EXPORT int stream_renderer_restore(const char* dir);
 
 VG_EXPORT int stream_renderer_resume();
+
+// Returns the active address-space control ops table used by gfxstream.
+// The pointer is opaque to C callers.
+VG_EXPORT const void* stream_renderer_get_address_space_device_control_ops(void);
+
+// Overrides the address-space HW funcs table used by allocator-backed ASG
+// contexts. Returns the previous opaque HW funcs pointer.
+VG_EXPORT const void* stream_renderer_set_address_space_hw_funcs(const void* hw_funcs);
 
 // Matches Resource3DInfo in rutabaga_gfx
 struct stream_renderer_3d_info {

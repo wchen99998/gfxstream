@@ -10,7 +10,9 @@ cc_library(
     name = "gfxstream_host_address_space",
     srcs = [
         "address_space_device.cpp",
+        "address_space_host_memory_allocator.cpp",
         "address_space_graphics.cpp",
+        "address_space_shared_slots_host_memory_allocator.cpp",
         "ring_buffer.cpp",
         "sub_allocator.cpp",
     ],
@@ -28,6 +30,8 @@ cc_library(
 cc_test(
     name = "gfxstream_host_address_space_tests",
     srcs = [
+        "address_space_host_memory_allocator_unittest.cpp",
+        "address_space_shared_slots_host_memory_allocator_unittest.cpp",
         "ring_buffer_unittest.cpp",
     ],
     deps = [

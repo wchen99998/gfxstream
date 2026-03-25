@@ -17,6 +17,7 @@
 #include "gfxstream/common/logging.h"
 
 namespace gfxstream {
+namespace host {
 namespace vk {
 namespace testing {
 namespace {
@@ -53,11 +54,10 @@ VulkanTestHelper::VulkanTestHelper()
       mLogger(),
       mVkEmu(VkEmulation::create(mVk, {}, getGfxstreamFeatures())),
       mBp(std::make_unique<BumpPool>()),
-      mDecoderContext(VkDecoderContext{.processName = "vulkan_test",
-                                       .gfxApiLogger = &mLogger,
-                                       .healthMonitor = nullptr,
-                                       .metricsLogger = nullptr,
-                                       }),
+      mDecoderContext(VkDecoderContext{
+          .processName = "vulkan_test",
+          .gfxApiLogger = &mLogger,
+      }),
       mTestDispatch(mVk, mBp.get(), &mDecoderContext) {
     validationErrorsFound = false;
 }
@@ -347,4 +347,5 @@ void VulkanTestHelper::transitionImageLayout(VkCommandBuffer cmdBuf, VkImage ima
 
 }  // namespace testing
 }  // namespace vk
+}  // namespace host
 }  // namespace gfxstream

@@ -76,18 +76,18 @@ class Renderer {
     //   asynchronously on its own thread. |loadStream| can be used right after
     //   the call as all the required data is copied here synchronously.
     virtual RenderChannelPtr createRenderChannel(
-            gfxstream::Stream* loadStream = nullptr,
+            Stream* loadStream = nullptr,
             uint32_t virtioGpuContextId = -1) = 0;
 
     // analog of createRenderChannel, but for the address space graphics device
     virtual void* addressSpaceGraphicsConsumerCreate(
         const AsgConsumerCreateInfo& info,
-        gfxstream::Stream* loadStream) = 0;
+        Stream* loadStream) = 0;
     virtual void addressSpaceGraphicsConsumerDestroy(void*) = 0;
     virtual void addressSpaceGraphicsConsumerPreSave(void* consumer) = 0;
     virtual void addressSpaceGraphicsConsumerSave(
             void* consumer,
-            gfxstream::Stream* stream) = 0;
+            Stream* stream) = 0;
     virtual void addressSpaceGraphicsConsumerPostSave(void* consumer) = 0;
     virtual void addressSpaceGraphicsConsumerRegisterPostLoadRenderThread(
             void* consumer) = 0;
@@ -103,6 +103,10 @@ class Renderer {
         std::string version;
     };
     virtual HardwareStrings getHardwareStrings() = 0;
+    virtual void getVulkanEmulationDeviceInfo(char** device_name, char** driver_info,
+                                              uint32_t* driver_version, uint32_t* api_version,
+                                              uint32_t* vendor_id, uint32_t* device_id,
+                                              uint32_t* device_type, uint64_t* device_memory) = 0;
 
     // A per-frame callback can be registered with setPostCallback(); to remove
     // it pass an empty callback. While a callback is registered, the renderer
@@ -238,6 +242,12 @@ class Renderer {
     virtual void setScreenMask(int width,
                                int height,
                                const uint8_t* rgbaData) = 0;
+    // setScreenBackground -
+    //    provide the image that should be rendered as the
+    //    device background.
+    virtual void setScreenBackground(int width,
+                               int height,
+                               const uint8_t* rgbaData) = 0;
 
     // setMultiDisplay
     //    add/modify/del multi-display window
@@ -282,10 +292,10 @@ class Renderer {
     virtual void resumeAll() = 0;
 
     virtual void save(
-            gfxstream::Stream* stream,
+            Stream* stream,
             const ITextureSaverPtr& textureSaver) = 0;
     virtual bool load(
-            gfxstream::Stream* stream,
+            Stream* stream,
             const ITextureLoaderPtr& textureLoader) = 0;
 
     // Fill GLES usage protobuf
@@ -309,11 +319,11 @@ class Renderer {
     // indicates the users wants to snip the entire screen.
     // - |rect|  represents a rectangle within the screen defined by
     // desiredWidth and desiredHeight.
+    static const int GET_SCREENSHOT_RESULT_PIXELS_SIZE = -2;  // Return code to get pixel count
     virtual int getScreenshot(unsigned int nChannels, unsigned int* width, unsigned int* height,
                               uint8_t* pixels, size_t* cPixels, int displayId = 0,
                               int desiredWidth = 0, int desiredHeight = 0, int desiredRotation = 0,
                               Rect rect = {{0, 0}, {0, 0}}) = 0;
-
 
     virtual void preLoad() = 0;
     virtual void postLoad() = 0;

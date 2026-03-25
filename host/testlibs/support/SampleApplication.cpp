@@ -20,10 +20,11 @@
 
 #include <thread>
 
-#include "FrameBuffer.h"
+#include "host/frame_buffer.h"
 #include "OpenGLESDispatch/OpenGLDispatchLoader.h"
-#include "RenderThreadInfo.h"
-#include "gfxstream/host/Features.h"
+#include "host/render_thread_info.h"
+#include "gfxstream/host/features.h"
+#include "gfxstream/host/gfxstream_format.h"
 #include "gfxstream/host/renderer_operations.h"
 #include "gfxstream/host/testing/OSWindow.h"
 #include "gfxstream/host/testing/ShaderUtils.h"
@@ -34,6 +35,7 @@
 #include "render-utils/render_api_platform_types.h"
 
 namespace gfxstream {
+namespace host {
 
 using gfxstream::base::AutoLock;
 using gfxstream::base::ConditionVariable;
@@ -105,7 +107,7 @@ bool shouldUseHostGpu() {
     if (useHost) {
         set_gfxstream_renderer(SELECTED_RENDERER_HOST);
     } else {
-        set_gfxstream_renderer(SELECTED_RENDERER_SWIFTSHADER_INDIRECT);
+        set_gfxstream_renderer(SELECTED_RENDERER_LAVAPIPE);
     }
 
     return useHost;
@@ -265,7 +267,7 @@ SampleApplication::SampleApplication(int windowWidth, int windowHeight, int refr
     mRenderThreadInfo.reset(new RenderThreadInfo());
     mRenderThreadInfo->initGl();
 
-    mColorBuffer = mFb->createColorBuffer(mWidth, mHeight, GL_RGBA, FRAMEWORK_FORMAT_GL_COMPATIBLE);
+    mColorBuffer = mFb->createColorBuffer(mWidth, mHeight, GfxstreamFormat::R8G8B8A8_UNORM);
     mContext = mFb->createEmulatedEglContext(0, 0, glVersion);
     mSurface = mFb->createEmulatedEglWindowSurface(0, mWidth, mHeight);
 
@@ -275,8 +277,7 @@ SampleApplication::SampleApplication(int windowWidth, int windowHeight, int refr
     if (mIsCompose && mTargetCb == 0) {
         mTargetCb = mFb->createColorBuffer(mFb->getWidth(),
                                            mFb->getHeight(),
-                                           GL_RGBA,
-                                           FRAMEWORK_FORMAT_GL_COMPATIBLE);
+                                           GfxstreamFormat::R8G8B8A8_UNORM);
         mFb->openColorBuffer(mTargetCb);
     }
  }
@@ -467,8 +468,8 @@ void SampleApplication::surfaceFlingerComposerLoop() {
     std::vector<unsigned int> hwcColorBuffers;
 
     for (int i = 0; i < ColorBufferQueue::kCapacity; i++) {
-        sfColorBuffers.push_back(mFb->createColorBuffer(mWidth, mHeight, GL_RGBA, FRAMEWORK_FORMAT_GL_COMPATIBLE));
-        hwcColorBuffers.push_back(mFb->createColorBuffer(mWidth, mHeight, GL_RGBA, FRAMEWORK_FORMAT_GL_COMPATIBLE));
+        sfColorBuffers.push_back(mFb->createColorBuffer(mWidth, mHeight, GfxstreamFormat::R8G8B8A8_UNORM));
+        hwcColorBuffers.push_back(mFb->createColorBuffer(mWidth, mHeight, GfxstreamFormat::R8G8B8A8_UNORM));
     }
 
     for (int i = 0; i < ColorBufferQueue::kCapacity; i++) {
@@ -565,4 +566,6 @@ bool SampleApplication::isSwANGLE() {
     return strstr(renderer, "ANGLE") && strstr(renderer, "SwiftShader");
 }
 
+
+}  // namespace host
 }  // namespace gfxstream

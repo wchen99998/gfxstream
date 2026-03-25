@@ -22,6 +22,8 @@ elif host_machine.system() == 'windows'
 elif host_machine.system() == 'darwin'
   cereal_cpp_args += '-DVK_USE_PLATFORM_METAL_EXT'
   cereal_cpp_args += '-DVK_USE_PLATFORM_MACOS_MVK'
+elif host_machine.system() == 'linux'
+  cereal_cpp_args += '-DVK_USE_PLATFORM_XCB_KHR'
 endif
 
 lib_vulkan_cereal = static_library(
@@ -33,12 +35,10 @@ lib_vulkan_cereal = static_library(
     inc_cereal,
     inc_common_base,
     inc_gfxstream_server,
-    inc_host_backend,
+    inc_host_common,
     inc_host_decoder_common,
     inc_host_features,
-    inc_host_health,
     inc_common_logging,
-    inc_host_metrics,
     inc_include,
     inc_stream_servers,
     inc_vulkan_headers,
@@ -46,10 +46,8 @@ lib_vulkan_cereal = static_library(
   ],
   link_with: [
     lib_common_base,
-    lib_host_backend,
+    lib_host_common,
     lib_host_features,
-    lib_host_health,
     lib_common_logging,
-    lib_host_metrics,
   ],
 )

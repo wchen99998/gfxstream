@@ -14,7 +14,7 @@
 
 add_library(
     gfxstream_host_library
-    SharedLibrary.cpp)
+    shared_library.cpp)
 
 target_include_directories(
     gfxstream_host_library
@@ -25,4 +25,5 @@ target_link_libraries(
     gfxstream_host_library
     PUBLIC
     gfxstream_common_base
-    gfxstream_common_logging)
+    gfxstream_common_logging
+    gfxstream_common_utils)

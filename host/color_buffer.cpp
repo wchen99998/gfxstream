@@ -1,0 +1,1111 @@
+// Copyright 2022 The Android Open Source Project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either expresso or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "color_buffer.h"
+
+#include <deque>
+
+#if GFXSTREAM_ENABLE_HOST_GLES
+#include "host/gl/emulation_gl.h"
+#endif
+#include "frame_buffer.h"
+#include "gfxstream/common/logging.h"
+#include "gfxstream/host/gfxstream_format.h"
+#include "gfxstream/synchronization/ConditionVariable.h"
+#include "gfxstream/synchronization/Lock.h"
+#include "vulkan/color_buffer_vk.h"
+#include "vulkan/vk_common_operations.h"
+
+namespace gfxstream {
+namespace host {
+namespace {
+
+#if GFXSTREAM_ENABLE_HOST_GLES
+using gl::ColorBufferGl;
+#endif
+using vk::ColorBufferVk;
+
+// ColorBufferVk natively supports YUV images. However, ColorBufferGl
+// needs to emulate YUV support by having an underlying RGBA texture
+// and adding in additional YUV<->RGBA conversions when needed. The
+// memory should not be shared between the VK YUV image and the GL RGBA
+// texture.
+bool shouldAttemptExternalMemorySharing(GfxstreamFormat format) {
+    return !gfxstream::host::IsYuvFormat(format);
+}
+
+bool shouldPreferVkReadback(GfxstreamFormat pixelsFormat) {
+    return pixelsFormat == GfxstreamFormat::R8G8B8A8_UNORM;
+}
+
+}  // namespace
+
+class ColorBuffer::Impl : public LazySnapshotObj<ColorBuffer::Impl> {
+   public:
+    static std::unique_ptr<Impl> create(gl::EmulationGl* emulationGl,
+                                        vk::VkEmulation* emulationVk,
+                                        uint32_t width,
+                                        uint32_t height,
+                                        GfxstreamFormat format,
+                                        HandleType handle,
+                                        gfxstream::Stream* stream = nullptr);
+
+    static std::unique_ptr<Impl> onLoad(gl::EmulationGl* emulationGl,
+                                        vk::VkEmulation* emulationVk,
+                                        gfxstream::Stream* stream);
+
+    void onSave(gfxstream::Stream* stream);
+    void restore();
+
+    HandleType getHndl() const { return mHandle; }
+    uint32_t getWidth() const { return mWidth; }
+    uint32_t getHeight() const { return mHeight; }
+    GfxstreamFormat getFormat() const { return mFormat; }
+
+    void readToBytes(int x, int y, int width, int height, GfxstreamFormat pixelsFormat,
+                     void* outPixels, uint64_t outPixelsSize);
+    void readToBytesScaled(int pixelsWidth, int pixelsHeight, int pixelsRotation, Rect rect,
+                           GfxstreamFormat pixelsFormat, void* outPixels,
+                           const std::optional<std::array<float, 16>>& colorTransform);
+    void readYuvToBytes(int x, int y, int width, int height, void* outPixels,
+                        uint32_t outPixelsSize);
+
+    bool updateFromBytes(int x, int y, int width, int height, GfxstreamFormat pixelsFormat,
+                         const void* pixels, void* metadata = nullptr);
+    bool updateGlFromBytes(const void* bytes, std::size_t bytesSize);
+
+    std::unique_ptr<BorrowedImageInfo> borrowForComposition(UsedApi api, bool isTarget);
+
+    bool flushFromGl();
+    bool flushFromVk();
+    bool flushFromVkBytes(const void* bytes, size_t bytesSize);
+    bool invalidateForGl();
+    bool invalidateForVk();
+    bool waitForPendingVulkanCompletion();
+    bool hasPendingVulkanCompletion();
+    void setPendingVulkanCompletion(CancelableFuture completionFuture,
+                                    std::shared_ptr<std::atomic<bool>> completionSucceeded);
+
+    std::optional<BlobDescriptorInfo> exportBlob();
+
+    bool ensureVkBacking(vk::VkEmulation& vkEmulation);
+
+    bool resolvePendingVulkanCompletion();
+    bool syncGlFromVkIfNeeded();
+
+#if GFXSTREAM_ENABLE_HOST_GLES
+    GLuint glOpGetTexture();
+    bool glOpBlitFromCurrentReadBuffer();
+    bool glOpBindToTexture();
+    bool glOpBindToTexture2();
+    bool glOpBindToRenderbuffer();
+    void glOpReadback(unsigned char* img, bool readbackBgra);
+    void glOpReadbackAsync(GLuint buffer, bool readbackBgra);
+    bool glOpImportEglNativePixmap(void* pixmap, bool preserveContent);
+    void glOpSwapYuvTexturesAndUpdate(GLenum format, GLenum type, GfxstreamFormat texturesFormat,
+                                      GLuint* textures);
+    bool glOpReadContents(size_t* outNumBytes, void* outContents);
+    bool glOpIsFastBlitSupported() const;
+    void glOpPostLayer(const ComposeLayer& l, int frameWidth, int frameHeight,
+        const std::optional<std::array<float, 16>>& colorTransform);
+    void glOpPostViewportScaledWithOverlay(
+        float rotation, float dx, float dy,
+        const std::optional<std::array<float, 16>>& colorTransform);
+#endif
+
+   private:
+    Impl(HandleType, uint32_t width, uint32_t height, GfxstreamFormat format);
+
+    const HandleType mHandle;
+    const uint32_t mWidth;
+    const uint32_t mHeight;
+    const GfxstreamFormat mFormat;
+
+#if GFXSTREAM_ENABLE_HOST_GLES
+    // If GL emulation is enabled.
+    std::unique_ptr<ColorBufferGl> mColorBufferGl;
+#endif
+
+    bool hasColorBuffer() const {
+#if GFXSTREAM_ENABLE_HOST_GLES
+        return mColorBufferGl || mColorBufferVk;
+#else
+        return mColorBufferVk != nullptr;
+#endif
+    };
+
+    // If Vk emulation is enabled.
+    std::unique_ptr<ColorBufferVk> mColorBufferVk;
+
+    bool mGlAndVkAreSharingExternalMemory = false;
+    bool mGlTexDirty = false;
+    bool mVkTexDirty = false;
+    gfxstream::base::Lock mPendingVulkanCompletionLock;
+    gfxstream::base::ConditionVariable mPendingVulkanCompletionCondition;
+    bool mPendingVulkanCompletionInProgress = false;
+    uint64_t mPendingVulkanCompletionGeneration = 0;
+
+    struct PendingVulkanCompletion {
+        CancelableFuture future;
+        std::shared_ptr<std::atomic<bool>> completionSucceeded;
+    };
+    std::deque<PendingVulkanCompletion> mPendingVulkanCompletions;
+};
+
+ColorBuffer::Impl::Impl(HandleType handle, uint32_t width, uint32_t height, GfxstreamFormat format)
+    : mHandle(handle),
+      mWidth(width),
+      mHeight(height),
+      mFormat(format) {}
+
+/*static*/
+std::unique_ptr<ColorBuffer::Impl> ColorBuffer::Impl::create(
+    gl::EmulationGl* emulationGl, vk::VkEmulation* emulationVk, uint32_t width, uint32_t height,
+    GfxstreamFormat format, HandleType handle, gfxstream::Stream* stream) {
+    std::unique_ptr<Impl> colorBuffer(new Impl(handle, width, height, format));
+
+    if (stream) {
+        // When vk snapshot enabled, mNeedRestore will be touched and set to false immediately.
+        colorBuffer->mNeedRestore = true;
+    }
+
+#if GFXSTREAM_ENABLE_HOST_GLES
+    if (emulationGl) {
+        if (stream) {
+            colorBuffer->mColorBufferGl = emulationGl->loadColorBuffer(stream);
+        } else {
+            colorBuffer->mColorBufferGl =
+                emulationGl->createColorBuffer(width, height, format, handle);
+        }
+        if (!colorBuffer->mColorBufferGl) {
+            GFXSTREAM_ERROR("Failed to initialize ColorBufferGl.");
+            return nullptr;
+        }
+    }
+#endif
+
+    if (emulationVk) {
+#if GFXSTREAM_ENABLE_HOST_GLES
+        const bool vulkanOnly = colorBuffer->mColorBufferGl == nullptr;
+#else
+        const bool vulkanOnly = true;
+#endif
+        const uint32_t memoryProperty = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        const uint32_t mipLevels = 1;
+        colorBuffer->mColorBufferVk =
+            vk::ColorBufferVk::create(*emulationVk, handle, width, height, format,
+                                      vulkanOnly, memoryProperty, stream, mipLevels);
+        if (!colorBuffer->mColorBufferVk) {
+            if (emulationGl) {
+                // Historically, ColorBufferVk setup was deferred until the first actual Vulkan
+                // usage. This allowed ColorBufferVk setup failures to be unintentionally avoided.
+            } else {
+                GFXSTREAM_ERROR("Failed to initialize ColorBufferVk.");
+                return nullptr;
+            }
+        }
+    }
+
+#if GFXSTREAM_ENABLE_HOST_GLES
+    bool vkSnapshotEnabled = emulationVk && emulationVk->getFeatures().VulkanSnapshots.enabled;
+
+    if ((!stream || vkSnapshotEnabled) && colorBuffer->mColorBufferGl && colorBuffer->mColorBufferVk &&
+        shouldAttemptExternalMemorySharing(format)) {
+        colorBuffer->touch();
+        auto memoryExport = emulationVk->exportColorBufferMemory(handle);
+        if (memoryExport) {
+            if (colorBuffer->mColorBufferGl->importMemory(
+                    memoryExport->handleInfo.toManagedDescriptor(),
+                    memoryExport->size, memoryExport->dedicatedAllocation,
+                    memoryExport->linearTiling)) {
+                colorBuffer->mGlAndVkAreSharingExternalMemory = true;
+            } else {
+                GFXSTREAM_ERROR("Failed to import memory to ColorBufferGl:%d", handle);
+            }
+        }
+    }
+#endif
+
+    return colorBuffer;
+}
+
+/*static*/
+std::unique_ptr<ColorBuffer::Impl> ColorBuffer::Impl::onLoad(gl::EmulationGl* emulationGl,
+                                                             vk::VkEmulation* emulationVk,
+                                                             gfxstream::Stream* stream) {
+    const auto handle = static_cast<HandleType>(stream->getBe32());
+    const auto width = static_cast<uint32_t>(stream->getBe32());
+    const auto height = static_cast<uint32_t>(stream->getBe32());
+    const auto format = static_cast<GfxstreamFormat>(stream->getBe32());
+
+    std::unique_ptr<Impl> colorBuffer = Impl::create(emulationGl, emulationVk, width, height,
+                                                     format, handle, stream);
+
+    return colorBuffer;
+}
+
+void ColorBuffer::Impl::onSave(gfxstream::Stream* stream) {
+    stream->putBe32(getHndl());
+    stream->putBe32(mWidth);
+    stream->putBe32(mHeight);
+    stream->putBe32(static_cast<uint32_t>(mFormat));
+
+#if GFXSTREAM_ENABLE_HOST_GLES
+    if (mColorBufferGl) {
+        mColorBufferGl->onSave(stream);
+    }
+#endif
+    if (mColorBufferVk) {
+        mColorBufferVk->onSave(stream);
+    }
+}
+
+void ColorBuffer::Impl::restore() {
+#if GFXSTREAM_ENABLE_HOST_GLES
+    if (mColorBufferGl) {
+        mColorBufferGl->restore();
+    }
+#endif
+}
+
+void ColorBuffer::Impl::readToBytes(
+        int x,
+        int y,
+        int width,
+        int height,
+        GfxstreamFormat pixelsFormat,
+        void* outPixels,
+        uint64_t outPixelsSize) {
+    touch();
+
+    if (mColorBufferVk && shouldPreferVkReadback(pixelsFormat)) {
+        if (!resolvePendingVulkanCompletion()) {
+            GFXSTREAM_FATAL("Failed to sync ColorBuffer:%d for Vulkan readback.", mHandle);
+        }
+        if (!invalidateForVk()) {
+            GFXSTREAM_FATAL("Failed to sync ColorBuffer:%d for Vulkan readback.", mHandle);
+        }
+        mColorBufferVk->readToBytes(x, y, width, height, outPixels, outPixelsSize);
+        return;
+    }
+
+#if GFXSTREAM_ENABLE_HOST_GLES
+    if (mColorBufferGl) {
+        if (!invalidateForGl()) {
+            GFXSTREAM_FATAL("Failed to sync ColorBuffer:%d for GL readback.", mHandle);
+        }
+        mColorBufferGl->readPixels(x, y, width, height, pixelsFormat, outPixels);
+        return;
+    }
+#endif
+
+    if (mColorBufferVk) {
+        mColorBufferVk->readToBytes(x, y, width, height, outPixels, outPixelsSize);
+        return;
+    }
+
+    GFXSTREAM_FATAL("No ColorBuffer impl");
+}
+
+void ColorBuffer::Impl::readToBytesScaled(
+    int pixelsWidth, int pixelsHeight, int pixelsRotation, Rect rect, GfxstreamFormat pixelsFormat,
+    void* outPixels, const std::optional<std::array<float, 16>>& colorTransform) {
+    touch();
+
+#if GFXSTREAM_ENABLE_HOST_GLES
+    if (mColorBufferGl) {
+        if (!invalidateForGl()) {
+            GFXSTREAM_FATAL("Failed to sync ColorBuffer:%d for scaled GL readback.", mHandle);
+        }
+        mColorBufferGl->readPixelsScaled(pixelsWidth, pixelsHeight, pixelsRotation,
+                                         rect, pixelsFormat, outPixels, colorTransform);
+        return;
+    }
+#endif
+
+    if (mColorBufferVk) {
+        if (!resolvePendingVulkanCompletion()) {
+            GFXSTREAM_FATAL("Failed to sync ColorBuffer:%d for scaled Vulkan readback.", mHandle);
+        }
+        if (!invalidateForVk()) {
+            GFXSTREAM_FATAL("Failed to sync ColorBuffer:%d for scaled Vulkan readback.", mHandle);
+        }
+        if (!shouldPreferVkReadback(pixelsFormat)) {
+            GFXSTREAM_ERROR(
+                "Readback is not supported for Vulkan ColorBuffer with format: %s.",
+                ToString(pixelsFormat).c_str());
+            return;
+        }
+        mColorBufferVk->readPixelsScaled(pixelsWidth, pixelsHeight, pixelsRotation, rect,
+                                         pixelsFormat, outPixels, colorTransform);
+        return;
+    }
+
+    GFXSTREAM_FATAL("%s: Unimplemented", __func__);
+}
+
+void ColorBuffer::Impl::readYuvToBytes(int x, int y, int width, int height, void* outPixels,
+                                       uint32_t outPixelsSize) {
+    touch();
+
+#if GFXSTREAM_ENABLE_HOST_GLES
+    if (mColorBufferGl) {
+        if (!invalidateForGl()) {
+            GFXSTREAM_FATAL("Failed to sync ColorBuffer:%d for GL YUV readback.", mHandle);
+        }
+        mColorBufferGl->readPixelsYUVCached(x, y, width, height, outPixels, outPixelsSize);
+        return;
+    }
+#endif
+
+    if (mColorBufferVk) {
+        if (!resolvePendingVulkanCompletion()) {
+            GFXSTREAM_FATAL("Failed to sync ColorBuffer:%d for Vulkan YUV readback.", mHandle);
+        }
+        if (!invalidateForVk()) {
+            GFXSTREAM_FATAL("Failed to sync ColorBuffer:%d for Vulkan YUV readback.", mHandle);
+        }
+        mColorBufferVk->readToBytes(x, y, width, height, outPixels, outPixelsSize);
+        return;
+    }
+
+    GFXSTREAM_FATAL("No ColorBuffer impl");
+}
+
+bool ColorBuffer::Impl::updateFromBytes(int x, int y, int width, int height, GfxstreamFormat pixelsFormat,
+                                        const void* pixels, void* metadata) {
+    touch();
+
+#if GFXSTREAM_ENABLE_HOST_GLES
+    if (mColorBufferGl) {
+        if (!invalidateForGl()) {
+            GFXSTREAM_ERROR("Failed to sync ColorBuffer:%d for GL sub-update.", mHandle);
+            return false;
+        }
+        bool res = mColorBufferGl->subUpdate(x, y, width, height, pixelsFormat, pixels, metadata);
+        if (res) {
+            flushFromGl();
+        }
+        return res;
+    }
+#endif
+
+    if (mColorBufferVk) {
+        return mColorBufferVk->updateFromBytes(x, y, width, height, pixels);
+    }
+
+    GFXSTREAM_FATAL("No ColorBuffer impl");
+    return false;
+}
+
+bool ColorBuffer::Impl::updateGlFromBytes(const void* bytes, std::size_t bytesSize) {
+#if GFXSTREAM_ENABLE_HOST_GLES
+    if (mColorBufferGl) {
+        touch();
+
+        if (!mColorBufferGl->replaceContents(bytes, bytesSize)) {
+            return false;
+        }
+        return flushFromGl();
+    }
+#endif
+
+    return true;
+}
+
+std::unique_ptr<BorrowedImageInfo> ColorBuffer::Impl::borrowForComposition(UsedApi api,
+                                                                           bool isTarget) {
+    switch (api) {
+        case UsedApi::kGl: {
+#if GFXSTREAM_ENABLE_HOST_GLES
+            if (!mColorBufferGl) {
+                GFXSTREAM_FATAL("ColorBufferGl not available");
+            }
+            if (!invalidateForGl()) {
+                GFXSTREAM_ERROR("Failed to sync ColorBuffer:%d for GL composition borrow.",
+                                mHandle);
+                return nullptr;
+            }
+            return mColorBufferGl->getBorrowedImageInfo();
+#endif
+        }
+        case UsedApi::kVk: {
+            if (!mColorBufferVk) {
+                GFXSTREAM_FATAL("ColorBufferVk not available");
+            }
+            return mColorBufferVk->borrowForComposition(isTarget);
+        }
+    }
+    GFXSTREAM_FATAL("%s: Unimplemented", __func__);
+    return nullptr;
+}
+
+bool ColorBuffer::Impl::flushFromGl() {
+#if GFXSTREAM_ENABLE_HOST_GLES
+    if (!(mColorBufferGl && mColorBufferVk)) {
+        return true;
+    }
+#endif
+
+    if (mGlAndVkAreSharingExternalMemory) {
+        return true;
+    }
+
+    // ColorBufferGl is currently considered the "main" backing. If this changes,
+    // the "main"  should be updated from the current contents of the GL backing.
+    gfxstream::base::AutoLock lock(mPendingVulkanCompletionLock);
+    mPendingVulkanCompletions.clear();
+    mPendingVulkanCompletionInProgress = false;
+    ++mPendingVulkanCompletionGeneration;
+    mVkTexDirty = false;
+    mGlTexDirty = true;
+    mPendingVulkanCompletionCondition.broadcast();
+    return true;
+}
+
+bool ColorBuffer::Impl::resolvePendingVulkanCompletion() {
+#if GFXSTREAM_ENABLE_HOST_GLES
+    if (!(mColorBufferGl && mColorBufferVk)) {
+        return true;
+    }
+#else
+    if (!mColorBufferVk) {
+        return true;
+    }
+#endif
+
+    if (mGlAndVkAreSharingExternalMemory) {
+        return true;
+    }
+
+    while (true) {
+        PendingVulkanCompletion pending;
+        uint64_t generation = 0;
+        {
+            gfxstream::base::AutoLock lock(mPendingVulkanCompletionLock);
+            mPendingVulkanCompletionCondition.wait(&lock, [this]() {
+                return !mPendingVulkanCompletionInProgress || mPendingVulkanCompletions.empty();
+            });
+            if (mPendingVulkanCompletions.empty()) {
+                return true;
+            }
+
+            pending = mPendingVulkanCompletions.front();
+            generation = mPendingVulkanCompletionGeneration;
+            mPendingVulkanCompletionInProgress = true;
+        }
+
+        const CancelableFutureStatus futureStatus = pending.future.get();
+        const bool completionSucceeded =
+            futureStatus == CancelableFutureStatus::kSuccess &&
+            pending.completionSucceeded &&
+            pending.completionSucceeded->load(std::memory_order_acquire);
+
+        gfxstream::base::AutoLock lock(mPendingVulkanCompletionLock);
+        if (mPendingVulkanCompletionGeneration != generation || mPendingVulkanCompletions.empty()) {
+            mPendingVulkanCompletionInProgress = false;
+            mPendingVulkanCompletionCondition.broadcast();
+            continue;
+        }
+
+        mPendingVulkanCompletions.pop_front();
+        mPendingVulkanCompletionInProgress = false;
+
+        if (!completionSucceeded) {
+            mPendingVulkanCompletions.clear();
+            ++mPendingVulkanCompletionGeneration;
+            mPendingVulkanCompletionCondition.broadcast();
+            GFXSTREAM_ERROR("Pending Vulkan completion failed for ColorBuffer:%d", mHandle);
+            return false;
+        }
+
+        if (!mPendingVulkanCompletions.empty()) {
+            mPendingVulkanCompletionCondition.broadcast();
+            continue;
+        }
+
+        mGlTexDirty = false;
+        mVkTexDirty = true;
+        ++mPendingVulkanCompletionGeneration;
+        mPendingVulkanCompletionCondition.broadcast();
+        return true;
+    }
+}
+
+bool ColorBuffer::Impl::syncGlFromVkIfNeeded() {
+#if GFXSTREAM_ENABLE_HOST_GLES
+    if (!(mColorBufferGl && mColorBufferVk)) {
+        return true;
+    }
+#else
+    if (!mColorBufferVk) {
+        return true;
+    }
+#endif
+
+    if (mGlAndVkAreSharingExternalMemory) {
+        return true;
+    }
+
+    while (true) {
+        if (!resolvePendingVulkanCompletion()) {
+            return false;
+        }
+
+        uint64_t generation = 0;
+        {
+            gfxstream::base::AutoLock lock(mPendingVulkanCompletionLock);
+            if (!mPendingVulkanCompletions.empty() || mPendingVulkanCompletionInProgress) {
+                continue;
+            }
+            if (!mVkTexDirty) {
+                return true;
+            }
+            generation = mPendingVulkanCompletionGeneration;
+        }
+
+        std::vector<uint8_t> contents;
+        if (!mColorBufferVk->readToBytes(&contents)) {
+            GFXSTREAM_ERROR("Failed to get VK contents for ColorBuffer:%d", mHandle);
+            return false;
+        }
+
+        if (contents.empty()) {
+            return false;
+        }
+
+#if GFXSTREAM_ENABLE_HOST_GLES
+        if (!mColorBufferGl->replaceContents(contents.data(), contents.size())) {
+            GFXSTREAM_ERROR("Failed to set GL contents for ColorBuffer:%d", mHandle);
+            return false;
+        }
+#endif
+
+        gfxstream::base::AutoLock lock(mPendingVulkanCompletionLock);
+        if (!mPendingVulkanCompletions.empty() || mPendingVulkanCompletionInProgress ||
+            mPendingVulkanCompletionGeneration != generation) {
+            continue;
+        }
+
+        mGlTexDirty = false;
+        mVkTexDirty = false;
+        ++mPendingVulkanCompletionGeneration;
+        return true;
+    }
+}
+
+bool ColorBuffer::Impl::flushFromVk() { return syncGlFromVkIfNeeded(); }
+
+bool ColorBuffer::Impl::flushFromVkBytes(const void* bytes, size_t bytesSize) {
+#if GFXSTREAM_ENABLE_HOST_GLES
+    if (!(mColorBufferGl && mColorBufferVk)) {
+        return true;
+    }
+#endif
+
+    if (mGlAndVkAreSharingExternalMemory) {
+        return true;
+    }
+
+#if GFXSTREAM_ENABLE_HOST_GLES
+    if (mColorBufferGl) {
+        if (!mColorBufferGl->replaceContents(bytes, bytesSize)) {
+            GFXSTREAM_ERROR("Failed to update ColorBuffer:%d GL backing from VK bytes.", mHandle);
+            return false;
+        }
+    }
+#endif
+    gfxstream::base::AutoLock lock(mPendingVulkanCompletionLock);
+    mPendingVulkanCompletions.clear();
+    mPendingVulkanCompletionInProgress = false;
+    mGlTexDirty = false;
+    mVkTexDirty = false;
+    ++mPendingVulkanCompletionGeneration;
+    mPendingVulkanCompletionCondition.broadcast();
+    return true;
+}
+
+bool ColorBuffer::Impl::invalidateForGl() {
+#if GFXSTREAM_ENABLE_HOST_GLES
+    if (!(mColorBufferGl && mColorBufferVk)) {
+        return true;
+    }
+#endif
+
+    if (mGlAndVkAreSharingExternalMemory) {
+        return true;
+    }
+
+    return syncGlFromVkIfNeeded();
+}
+
+bool ColorBuffer::Impl::invalidateForVk() {
+#if GFXSTREAM_ENABLE_HOST_GLES
+    if (!(mColorBufferGl && mColorBufferVk)) {
+        return true;
+    }
+#endif
+
+    if (mGlAndVkAreSharingExternalMemory) {
+        return true;
+    }
+
+    {
+        gfxstream::base::AutoLock lock(mPendingVulkanCompletionLock);
+        if (!mGlTexDirty) {
+            return true;
+        }
+    }
+
+#if GFXSTREAM_ENABLE_HOST_GLES
+    std::size_t contentsSize = 0;
+    if (!mColorBufferGl->readContents(&contentsSize, nullptr)) {
+        GFXSTREAM_ERROR("Failed to get GL contents size for ColorBuffer:%d", mHandle);
+        return false;
+    }
+
+    std::vector<uint8_t> contents(contentsSize, 0);
+
+    if (!mColorBufferGl->readContents(&contentsSize, contents.data())) {
+        GFXSTREAM_ERROR("Failed to get GL contents for ColorBuffer:%d", mHandle);
+        return false;
+    }
+
+    if (!mColorBufferVk->updateFromBytes(contents)) {
+        GFXSTREAM_ERROR("Failed to set VK contents for ColorBuffer:%d", mHandle);
+        return false;
+    }
+#endif
+    gfxstream::base::AutoLock lock(mPendingVulkanCompletionLock);
+    mPendingVulkanCompletions.clear();
+    mPendingVulkanCompletionInProgress = false;
+    mGlTexDirty = false;
+    mVkTexDirty = false;
+    ++mPendingVulkanCompletionGeneration;
+    mPendingVulkanCompletionCondition.broadcast();
+    return true;
+}
+
+bool ColorBuffer::Impl::waitForPendingVulkanCompletion() {
+    return resolvePendingVulkanCompletion();
+}
+
+bool ColorBuffer::Impl::hasPendingVulkanCompletion() {
+#if GFXSTREAM_ENABLE_HOST_GLES
+    if (!(mColorBufferGl && mColorBufferVk)) {
+        return false;
+    }
+#else
+    if (!mColorBufferVk) {
+        return false;
+    }
+#endif
+
+    if (mGlAndVkAreSharingExternalMemory) {
+        return false;
+    }
+
+    gfxstream::base::AutoLock lock(mPendingVulkanCompletionLock);
+    return !mPendingVulkanCompletions.empty();
+}
+
+void ColorBuffer::Impl::setPendingVulkanCompletion(
+    CancelableFuture completionFuture,
+    std::shared_ptr<std::atomic<bool>> completionSucceeded) {
+#if GFXSTREAM_ENABLE_HOST_GLES
+    if (!(mColorBufferGl && mColorBufferVk)) {
+        return;
+    }
+#else
+    if (!mColorBufferVk) {
+        return;
+    }
+#endif
+
+    if (mGlAndVkAreSharingExternalMemory) {
+        return;
+    }
+
+    gfxstream::base::AutoLock lock(mPendingVulkanCompletionLock);
+    mPendingVulkanCompletions.push_back(PendingVulkanCompletion{
+        .future = std::move(completionFuture),
+        .completionSucceeded = std::move(completionSucceeded),
+    });
+    mGlTexDirty = false;
+    mVkTexDirty = false;
+    mPendingVulkanCompletionCondition.broadcast();
+}
+
+std::optional<BlobDescriptorInfo> ColorBuffer::Impl::exportBlob() {
+    if (!mColorBufferVk) {
+        return std::nullopt;
+    }
+
+    return mColorBufferVk->exportBlob();
+}
+
+bool ColorBuffer::Impl::ensureVkBacking(vk::VkEmulation& vkEmulation) {
+    if (mColorBufferVk) {
+        return true;
+    }
+
+#if GFXSTREAM_ENABLE_HOST_GLES
+    const bool vulkanOnly = mColorBufferGl == nullptr;
+#else
+    const bool vulkanOnly = true;
+#endif
+    const uint32_t memoryProperty = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    const uint32_t mipLevels = 1;
+
+    mColorBufferVk = vk::ColorBufferVk::create(vkEmulation, mHandle, mWidth, mHeight, mFormat,
+                                               vulkanOnly, memoryProperty, /*stream=*/nullptr,
+                                               mipLevels);
+    if (!mColorBufferVk) {
+        GFXSTREAM_ERROR("ensureVkBacking: Failed to lazily create ColorBufferVk for handle:%d",
+                        mHandle);
+        return false;
+    }
+
+    return true;
+}
+
+#if GFXSTREAM_ENABLE_HOST_GLES
+bool ColorBuffer::Impl::glOpBlitFromCurrentReadBuffer() {
+    if (!mColorBufferGl) {
+        GFXSTREAM_FATAL("ColorBufferGl not available");
+    }
+
+    touch();
+
+    if (!mColorBufferGl->blitFromCurrentReadBuffer()) {
+        return false;
+    }
+    return flushFromGl();
+}
+
+bool ColorBuffer::Impl::glOpBindToTexture() {
+    if (!mColorBufferGl) {
+        GFXSTREAM_FATAL("ColorBufferGl not available");
+    }
+
+    touch();
+
+    if (!invalidateForGl()) {
+        return false;
+    }
+
+    return mColorBufferGl->bindToTexture();
+}
+
+bool ColorBuffer::Impl::glOpBindToTexture2() {
+    if (!mColorBufferGl) {
+        GFXSTREAM_FATAL("ColorBufferGl not available");
+    }
+
+    if (!invalidateForGl()) {
+        return false;
+    }
+
+    return mColorBufferGl->bindToTexture2();
+}
+
+bool ColorBuffer::Impl::glOpBindToRenderbuffer() {
+    if (!mColorBufferGl) {
+        GFXSTREAM_FATAL("ColorBufferGl not available");
+    }
+
+    touch();
+
+    if (!invalidateForGl()) {
+        return false;
+    }
+
+    return mColorBufferGl->bindToRenderbuffer();
+}
+
+GLuint ColorBuffer::Impl::glOpGetTexture() {
+    if (!mColorBufferGl) {
+        GFXSTREAM_FATAL("ColorBufferGl not available");
+    }
+
+    touch();
+
+    if (!invalidateForGl()) {
+        GFXSTREAM_FATAL("Failed to sync ColorBuffer:%d for GL texture query.", mHandle);
+    }
+
+    return mColorBufferGl->getTexture();
+}
+
+void ColorBuffer::Impl::glOpReadback(unsigned char* img, bool readbackBgra) {
+    if (!mColorBufferGl) {
+        GFXSTREAM_FATAL("ColorBufferGl not available");
+    }
+
+    touch();
+
+    if (!invalidateForGl()) {
+        GFXSTREAM_FATAL("Failed to sync ColorBuffer:%d for GL readback.", mHandle);
+    }
+
+    return mColorBufferGl->readback(img, readbackBgra);
+}
+
+void ColorBuffer::Impl::glOpReadbackAsync(GLuint buffer, bool readbackBgra) {
+    if (!mColorBufferGl) {
+        GFXSTREAM_FATAL("ColorBufferGl not available");
+    }
+
+    touch();
+
+    if (!invalidateForGl()) {
+        GFXSTREAM_FATAL("Failed to sync ColorBuffer:%d for async GL readback.", mHandle);
+    }
+
+    mColorBufferGl->readbackAsync(buffer, readbackBgra);
+}
+
+bool ColorBuffer::Impl::glOpImportEglNativePixmap(void* pixmap, bool preserveContent) {
+    if (!mColorBufferGl) {
+        GFXSTREAM_FATAL("ColorBufferGl not available");
+    }
+
+    return mColorBufferGl->importEglNativePixmap(pixmap, preserveContent);
+}
+
+void ColorBuffer::Impl::glOpSwapYuvTexturesAndUpdate(GLenum format, GLenum type,
+                                                     GfxstreamFormat texturesFormat,
+                                                     GLuint* textures) {
+    if (!mColorBufferGl) {
+        GFXSTREAM_FATAL("ColorBufferGl not available");
+    }
+
+    mColorBufferGl->swapYUVTextures(texturesFormat, textures);
+
+    // This makes ColorBufferGl regenerate the RGBA texture using
+    // YUVConverter::drawConvert() with the updated YUV textures.
+    mColorBufferGl->subUpdate(0, 0, mWidth, mHeight, texturesFormat, /*pixels=*/nullptr);
+
+    flushFromGl();
+}
+
+bool ColorBuffer::Impl::glOpReadContents(size_t* outNumBytes, void* outContents) {
+    if (!mColorBufferGl) {
+        GFXSTREAM_FATAL("ColorBufferGl not available");
+    }
+
+    if (!invalidateForGl()) {
+        return false;
+    }
+
+    return mColorBufferGl->readContents(outNumBytes, outContents);
+}
+
+bool ColorBuffer::Impl::glOpIsFastBlitSupported() const {
+    if (!mColorBufferGl) {
+        GFXSTREAM_FATAL("ColorBufferGl not available");
+    }
+
+    return mColorBufferGl->isFastBlitSupported();
+}
+
+void ColorBuffer::Impl::glOpPostLayer(const ComposeLayer& l, int frameWidth, int frameHeight,
+        const std::optional<std::array<float, 16>>& colorTransform) {
+    if (!mColorBufferGl) {
+        GFXSTREAM_FATAL("ColorBufferGl not available");
+    }
+
+    if (!invalidateForGl()) {
+        GFXSTREAM_FATAL("Failed to sync ColorBuffer:%d for GL composition.", mHandle);
+    }
+
+    mColorBufferGl->postLayer(l, frameWidth, frameHeight, colorTransform);
+}
+
+void ColorBuffer::Impl::glOpPostViewportScaledWithOverlay(
+    float rotation, float dx, float dy,
+    const std::optional<std::array<float, 16>>& colorTransform) {
+    if (!mColorBufferGl) {
+        GFXSTREAM_FATAL("ColorBufferGl not available");
+    }
+
+    if (!invalidateForGl()) {
+        GFXSTREAM_FATAL("Failed to sync ColorBuffer:%d for GL overlay composition.", mHandle);
+    }
+
+    mColorBufferGl->postViewportScaledWithOverlay(rotation, dx, dy, colorTransform);
+}
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////
+
+/*static*/
+std::shared_ptr<ColorBuffer> ColorBuffer::create(gl::EmulationGl* emulationGl,
+                                                 vk::VkEmulation* emulationVk,
+                                                 uint32_t width,
+                                                 uint32_t height,
+                                                 GfxstreamFormat format,
+                                                 HandleType handle,
+                                                 gfxstream::Stream* stream) {
+    std::shared_ptr<ColorBuffer> colorbuffer(new ColorBuffer());
+
+    colorbuffer->mImpl = ColorBuffer::Impl::create(emulationGl, emulationVk, width, height, format,
+                                                   handle, stream);
+    if (!colorbuffer->mImpl) {
+        return nullptr;
+    }
+
+    return colorbuffer;
+}
+
+/*static*/
+std::shared_ptr<ColorBuffer> ColorBuffer::onLoad(gl::EmulationGl* emulationGl,
+                                                 vk::VkEmulation* emulationVk,
+                                                 gfxstream::Stream* stream) {
+    std::shared_ptr<ColorBuffer> colorbuffer(new ColorBuffer());
+
+    colorbuffer->mImpl = ColorBuffer::Impl::onLoad(emulationGl, emulationVk, stream);
+    if (!colorbuffer->mImpl) {
+        return nullptr;
+    }
+    colorbuffer->mNeedRestore = true;
+
+    return colorbuffer;
+}
+
+void ColorBuffer::onSave(gfxstream::Stream* stream) { mImpl->onSave(stream); }
+
+void ColorBuffer::restore() { mImpl->touch(); }
+
+HandleType ColorBuffer::getHndl() const { return mImpl->getHndl(); }
+
+uint32_t ColorBuffer::getWidth() const { return mImpl->getWidth(); }
+
+uint32_t ColorBuffer::getHeight() const { return mImpl->getHeight(); }
+
+GfxstreamFormat ColorBuffer::getFormat() const { return mImpl->getFormat(); }
+
+void ColorBuffer::readToBytes(int x, int y, int width, int height, GfxstreamFormat pixelsFormat,
+                              void* outPixels, uint64_t outPixelsSize) {
+    mImpl->readToBytes(x, y, width, height, pixelsFormat, outPixels, outPixelsSize);
+}
+
+void ColorBuffer::readToBytesScaled(int pixelsWidth, int pixelsHeight, int pixelsRotation,
+                                    const Rect& rect, GfxstreamFormat pixelsFormat, void* outPixels,
+                                    const std::optional<std::array<float, 16>>& colorTransform) {
+    mImpl->readToBytesScaled(pixelsWidth, pixelsHeight, pixelsRotation, rect, pixelsFormat,
+                             outPixels, colorTransform);
+}
+
+void ColorBuffer::readYuvToBytes(int x, int y, int width, int height, void* outPixels,
+                                 uint32_t outPixelsSize) {
+    mImpl->readYuvToBytes(x, y, width, height, outPixels, outPixelsSize);
+}
+
+bool ColorBuffer::updateFromBytes(int x, int y, int width, int height,
+                                  GfxstreamFormat pixelsFormat,
+                                  const void* pixels, void* metadata) {
+    return mImpl->updateFromBytes(x, y, width, height, pixelsFormat, pixels, metadata);
+}
+
+bool ColorBuffer::updateGlFromBytes(const void* bytes, std::size_t bytesSize) {
+    return mImpl->updateGlFromBytes(bytes, bytesSize);
+}
+
+std::unique_ptr<BorrowedImageInfo> ColorBuffer::borrowForComposition(UsedApi api, bool isTarget) {
+    return mImpl->borrowForComposition(api, isTarget);
+}
+
+bool ColorBuffer::flushFromGl() { return mImpl->flushFromGl(); }
+
+bool ColorBuffer::flushFromVk() { return mImpl->flushFromVk(); }
+
+bool ColorBuffer::flushFromVkBytes(const void* bytes, size_t bytesSize) {
+    return mImpl->flushFromVkBytes(bytes, bytesSize);
+}
+
+bool ColorBuffer::invalidateForGl() { return mImpl->invalidateForGl(); }
+
+bool ColorBuffer::invalidateForVk() { return mImpl->invalidateForVk(); }
+
+bool ColorBuffer::waitForPendingVulkanCompletion() {
+    return mImpl->waitForPendingVulkanCompletion();
+}
+
+bool ColorBuffer::hasPendingVulkanCompletion() {
+    return mImpl->hasPendingVulkanCompletion();
+}
+
+void ColorBuffer::setPendingVulkanCompletion(
+    CancelableFuture completionFuture,
+    std::shared_ptr<std::atomic<bool>> completionSucceeded) {
+    mImpl->setPendingVulkanCompletion(std::move(completionFuture),
+                                      std::move(completionSucceeded));
+}
+
+std::optional<BlobDescriptorInfo> ColorBuffer::exportBlob() { return mImpl->exportBlob(); }
+
+bool ColorBuffer::ensureVkBacking(vk::VkEmulation& vkEmulation) {
+    return mImpl->ensureVkBacking(vkEmulation);
+}
+
+#if GFXSTREAM_ENABLE_HOST_GLES
+GLuint ColorBuffer::glOpGetTexture() { return mImpl->glOpGetTexture(); }
+
+bool ColorBuffer::glOpBlitFromCurrentReadBuffer() { return mImpl->glOpBlitFromCurrentReadBuffer(); }
+
+bool ColorBuffer::glOpBindToTexture() { return mImpl->glOpBindToTexture(); }
+
+bool ColorBuffer::glOpBindToTexture2() { return mImpl->glOpBindToTexture2(); }
+
+bool ColorBuffer::glOpBindToRenderbuffer() { return mImpl->glOpBindToRenderbuffer(); }
+
+void ColorBuffer::glOpReadback(unsigned char* img, bool readbackBgra) {
+    return mImpl->glOpReadback(img, readbackBgra);
+}
+
+void ColorBuffer::glOpReadbackAsync(GLuint buffer, bool readbackBgra) {
+    return mImpl->glOpReadbackAsync(buffer, readbackBgra);
+}
+
+bool ColorBuffer::glOpImportEglNativePixmap(void* pixmap, bool preserveContent) {
+    return mImpl->glOpImportEglNativePixmap(pixmap, preserveContent);
+}
+
+void ColorBuffer::glOpSwapYuvTexturesAndUpdate(GLenum format, GLenum type,
+                                               GfxstreamFormat texturesFormat, GLuint* textures) {
+    return mImpl->glOpSwapYuvTexturesAndUpdate(format, type, texturesFormat, textures);
+}
+
+bool ColorBuffer::glOpReadContents(size_t* outNumBytes, void* outContents) {
+    return mImpl->glOpReadContents(outNumBytes, outContents);
+}
+
+bool ColorBuffer::glOpIsFastBlitSupported() const { return mImpl->glOpIsFastBlitSupported(); }
+
+void ColorBuffer::glOpPostLayer(const ComposeLayer& l, int frameWidth, int frameHeight,
+                            const std::optional<std::array<float, 16>>& colorTransform) {
+    return mImpl->glOpPostLayer(l, frameWidth, frameHeight, colorTransform);
+}
+
+void ColorBuffer::glOpPostViewportScaledWithOverlay(
+    float rotation, float dx, float dy,
+    const std::optional<std::array<float, 16>>& colorTransform) {
+    return mImpl->glOpPostViewportScaledWithOverlay(rotation, dx, dy, colorTransform);
+}
+
+#endif
+
+}  // namespace host
+}  // namespace gfxstream

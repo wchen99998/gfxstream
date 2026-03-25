@@ -14,12 +14,14 @@
 
 #pragma once
 
+#include <vulkan/vulkan.h>
+
 #include "goldfish_vk_dispatch.h"
-#include "vulkan/VkDecoderGlobalState.h"
-#include "vulkan/vulkan.h"
-#include "VulkanBoxedHandles.h"
+#include "vulkan/vk_decoder_global_state.h"
+#include "vulkan_boxed_handles.h"
 
 namespace gfxstream {
+namespace host {
 namespace vk {
 namespace testing {
 
@@ -324,4 +326,5 @@ class VkDecoderTestDispatch {
 
 }  // namespace testing
 }  // namespace vk
+}  // namespace host
 }  // namespace gfxstream

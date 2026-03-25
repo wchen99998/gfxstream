@@ -21,10 +21,9 @@ cc_library_static {
     defaults: ["gfxstream_host_cc_defaults"],
     static_libs: [
         "libgfxstream_common_base",
-        "libgfxstream_host_backend",
+        "libgfxstream_host_common",
         "libgfxstream_host_decoder_common",
         "libgfxstream_host_features",
-        "libgfxstream_host_health",
         "libgfxstream_common_logging",
     ],
     srcs: [
@@ -38,6 +37,7 @@ cc_library_static {
     header_libs: [
         "libgfxstream_thirdparty_vulkan_headers",
         "libgfxstream_host_vulkan_cereal_common",
+        "libgfxstream_thirdparty_xcb_headers",
     ],
     export_header_lib_headers: [
         "libgfxstream_thirdparty_vulkan_headers",

@@ -16,7 +16,7 @@ add_library(
     gles2_dec
     gles2_dec.cpp
     gles2_server_context.cpp
-    GLESv2Decoder.cpp)
+    gles_v2_decoder.cpp)
 target_link_libraries(
     gles2_dec
     PUBLIC
@@ -27,7 +27,7 @@ target_link_libraries(
     PRIVATE
     gfxstream_common_base
     gfxstream_common_logging
-    gfxstream_host_backend
+    gfxstream_host_common
     gfxstream_host_library
     gfxstream_opengl_headers
     )

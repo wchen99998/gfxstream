@@ -14,13 +14,14 @@
 
 #include <gtest/gtest.h>
 
-#include "FrameBuffer.h"
+#include "frame_buffer.h"
 #include "gfxstream/host/testing/HelloTriangle.h"
 #include "gfxstream/host/testing/GLSnapshotTestDispatch.h"
 #include "gfxstream/host/testing/GLSnapshotTesting.h"
 #include "gfxstream/host/testing/OSWindow.h"
 
 namespace gfxstream {
+namespace host {
 namespace gl {
 namespace {
 
@@ -96,4 +97,5 @@ TYPED_TEST(SnapshotGlRenderingSampleTest, SnapshotDrawLoop) {
 
 }  // namespace
 }  // namespace gl
+}  // namespace host
 }  // namespace gfxstream

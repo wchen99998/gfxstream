@@ -17,13 +17,13 @@
 
 #include <memory>
 
-#include "RenderLibImpl.h"
+#include "render_lib_impl.h"
 #include "gfxstream/common/logging.h"
 
 namespace gfxstream {
 
 RENDER_API_EXPORT RenderLibPtr initLibrary() {
-    return RenderLibPtr(new RenderLibImpl());
+    return RenderLibPtr(new gfxstream::host::RenderLibImpl());
 }
 
 }  // namespace gfxstream

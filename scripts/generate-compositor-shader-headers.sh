@@ -13,11 +13,11 @@
 # limitations under the License.
 
 python3 scripts/glsl-shader-to-spv.py \
-    host/vulkan/Compositor.vert \
-    host/vulkan/CompositorVertexShader.h \
-    compositorVertexShader
+    host/vulkan/compositor.vert \
+    host/vulkan/compositor_vertex_shader.h \
+    kCompositorVertexShader
 
 python3 scripts/glsl-shader-to-spv.py \
-    host/vulkan/Compositor.frag \
-    host/vulkan/CompositorFragmentShader.h \
-    compositorFragmentShader
+    host/vulkan/compositor.frag \
+    host/vulkan/compositor_fragment_shader.h \
+    kCompositorFragmentShader
